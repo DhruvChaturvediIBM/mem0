@@ -37,39 +37,28 @@ jobs:
           pip install ruff==0.16.0
 
       - name: Lint
-        run: |
-          ruff check mem0/vector_stores/db2.py mem0/configs/vector_stores/db2.py
+        run: ruff check mem0/vector_stores/db2.py mem0/configs/vector_stores/db2.py
 
-      - name: Run unit tests (no Db2 required)
-        run: |
-          pytest tests/vector_stores/test_db2.py -v -k "not live"
+      - name: Unit tests
+        run: pytest tests/vector_stores/test_db2.py -v -k "not live"
 
   integration-tests:
     name: Integration tests (live Db2)
-    runs-on: ubuntu-latest
-    if: >
-      vars.DB2_HOST != '' &&
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install ibm_db and dependencies
+      - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install -e ".[test]"
           pip install ibm_db python-dotenv
 
-      - name: Run live integration tests
+      - name: Live integration tests
         env:
           DB2_DATABASE: ${{ secrets.DB2_DATABASE }}
           DB2_HOST: ${{ secrets.DB2_HOST }}
           DB2_PORT: ${{ secrets.DB2_PORT }}
           DB2_USERNAME: ${{ secrets.DB2_USERNAME }}
           DB2_PASSWORD: ${{ secrets.DB2_PASSWORD }}
-        run: |
-          pytest tests/vector_stores/test_db2.py -v -k "live"
+        run: pytest tests/vector_stores/test_db2.py -v -k "live"
