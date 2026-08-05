@@ -48,11 +48,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Python 3.11
+        run: |
+          if ! python3.11 --version &>/dev/null; then
+            sudo dnf install -y python3.11 python3.11-pip python3.11-devel || \
+            sudo yum install -y python3.11 python3.11-pip python3.11-devel
+          fi
+
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -e ".[test]"
-          pip install ibm_db python-dotenv
+          python3.11 -m pip install --upgrade pip
+          python3.11 -m pip install -e ".[test]"
+          python3.11 -m pip install ibm_db python-dotenv
 
       - name: Live integration tests
         env:
@@ -61,4 +68,4 @@ jobs:
           DB2_PORT: ${{ secrets.DB2_PORT }}
           DB2_USERNAME: ${{ secrets.DB2_USERNAME }}
           DB2_PASSWORD: ${{ secrets.DB2_PASSWORD }}
-        run: pytest tests/vector_stores/test_db2.py -v -k "live"
+        run: python3.11 -m pytest tests/vector_stores/test_db2.py -v -k "live"
