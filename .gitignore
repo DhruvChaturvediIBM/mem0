@@ -191,3 +191,13 @@ qdrant_storage/
 testing.ipynb
 .weave/
 
+
+# Named venvs (e.g. .venv-cov, .venv-dev)
+.venv*/
+venv*/
+
+# Bob AI assistant cache
+.bob/
+
+# Local HTML reports
+report.html
