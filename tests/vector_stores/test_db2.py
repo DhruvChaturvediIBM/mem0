@@ -6,11 +6,23 @@ marker.  They run in CI without any Db2 installation.
 Integration tests (real DB): guarded by ``@requires_db2_credentials``.  Set the
 following environment variables to enable them::
 
-    DB2_DATABASE=TESTDB
-    DB2_HOST=Geetika-5y420-x86.dev.fyre.ibm.com
-    DB2_PORT=50000
-    DB2_USERNAME=Geetika
-    DB2_PASSWORD=Geet#246
+    DB2_DATABASE=BLUDB
+    DB2_HOST=localhost
+    DB2_PORT=25000
+    DB2_USERNAME=db2inst1
+    DB2_PASSWORD=<your-password>
+
+Db2 Community Edition (Docker) — quickstart::
+
+    docker run -itd --name db2ce \\
+      -e DB2INST1_PASSWORD=password \\
+      -e DBNAME=BLUDB \\
+      -e LICENSE=accept \\
+      -p 25000:25000 \\
+      icr.io/db2_community/db2
+
+    export DB2_DATABASE=BLUDB DB2_HOST=localhost DB2_PORT=25000 \\
+           DB2_USERNAME=db2inst1 DB2_PASSWORD=password
 """
 
 from __future__ import annotations
@@ -64,7 +76,7 @@ from mem0.vector_stores.db2 import Db2VectorStore, OutputData, _distance_to_scor
 
 DB2_DATABASE = os.environ.get("DB2_DATABASE", "")
 DB2_HOST = os.environ.get("DB2_HOST", "")
-DB2_PORT = int(os.environ.get("DB2_PORT", "50000"))
+DB2_PORT = int(os.environ.get("DB2_PORT", "25000"))
 DB2_USERNAME = os.environ.get("DB2_USERNAME", "")
 DB2_PASSWORD = os.environ.get("DB2_PASSWORD", "")
 
@@ -134,7 +146,7 @@ def _store(cursor_rows=None, fetchone_row=None, **kwargs):
 
 @pytest.fixture()
 def db2_store():
-    """Create a real Db2VectorStore against TESTDB, then clean up."""
+    """Create a real Db2VectorStore against the configured DB, then clean up."""
     if not (DB2_DATABASE and DB2_HOST and DB2_USERNAME and DB2_PASSWORD):
         pytest.skip("Db2 credentials not configured")
 
@@ -180,7 +192,7 @@ class TestDb2Config:
             connection_params={
                 "database": "DB",
                 "host": "localhost",
-                "port": 50000,
+                "port": 25000,
                 "username": "u",
                 "password": "p",
             },
@@ -876,9 +888,9 @@ class TestVectorStoreConfig:
             provider="db2",
             config={
                 "connection_params": {
-                    "database": "TESTDB",
+                    "database": "BLUDB",
                     "host": "localhost",
-                    "port": 50000,
+                    "port": 25000,
                     "username": "db2user",
                     "password": "secret",
                 },

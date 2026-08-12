@@ -6,11 +6,17 @@ instance using hand-crafted vectors — no LLM required.
 Set connection details in examples/misc/.env (copied from .env.example) or
 export the variables manually before running:
 
-    export DB2_DATABASE=TESTDB
-    export DB2_HOST=...
-    export DB2_PORT=50000
-    export DB2_USERNAME=...
-    export DB2_PASSWORD=...
+    export DB2_DATABASE=BLUDB
+    export DB2_HOST=localhost
+    export DB2_PORT=25000
+    export DB2_USERNAME=db2inst1
+    export DB2_PASSWORD=<your-password>
+
+Db2 Community Edition (Docker) — quickstart:
+
+    docker run -itd --name db2ce \\
+      -e DB2INST1_PASSWORD=password -e DBNAME=BLUDB -e LICENSE=accept \\
+      -p 25000:25000 icr.io/db2_community/db2
 """
 
 from __future__ import annotations
@@ -29,9 +35,9 @@ if _ENV_FILE.exists():
         pass
 
 CONNECTION_PARAMS = {
-    "database": os.environ.get("DB2_DATABASE", "TESTDB"),
-    "host": os.environ.get("DB2_HOST", ""),
-    "port": int(os.environ.get("DB2_PORT", "50000")),
+    "database": os.environ.get("DB2_DATABASE", "BLUDB"),
+    "host": os.environ.get("DB2_HOST", "localhost"),
+    "port": int(os.environ.get("DB2_PORT", "25000")),
     "username": os.environ.get("DB2_USERNAME", ""),
     "password": os.environ.get("DB2_PASSWORD", ""),
 }
