@@ -1,0 +1,72 @@
+[
+  {
+    "id": "doc_001",
+    "text": "Alice has a golden retriever named Max who loves to play fetch in the park.",
+    "user_id": "alice",
+    "category": "pets",
+    "tags": ["dog", "golden retriever", "outdoor"]
+  },
+  {
+    "id": "doc_002",
+    "text": "Bob adopted two rescue cats from the local shelter last summer.",
+    "user_id": "bob",
+    "category": "pets",
+    "tags": ["cat", "rescue", "shelter"]
+  },
+  {
+    "id": "doc_003",
+    "text": "Charlie is a senior Python engineer who specialises in building data pipelines with Apache Spark.",
+    "user_id": "charlie",
+    "category": "tech",
+    "tags": ["python", "spark", "data engineering"]
+  },
+  {
+    "id": "doc_004",
+    "text": "Diana is learning Rust and finds memory safety guarantees fascinating.",
+    "user_id": "diana",
+    "category": "tech",
+    "tags": ["rust", "systems programming", "memory safety"]
+  },
+  {
+    "id": "doc_005",
+    "text": "Eve runs a vegetarian restaurant downtown and experiments with fusion cuisine.",
+    "user_id": "eve",
+    "category": "food",
+    "tags": ["vegetarian", "restaurant", "fusion"]
+  },
+  {
+    "id": "doc_006",
+    "text": "Frank is training for a marathon and tracks his runs with a GPS watch every morning.",
+    "user_id": "frank",
+    "category": "fitness",
+    "tags": ["marathon", "running", "GPS", "training"]
+  },
+  {
+    "id": "doc_007",
+    "text": "Grace volunteers at an animal shelter every weekend and helps socialise shy dogs.",
+    "user_id": "grace",
+    "category": "pets",
+    "tags": ["volunteer", "animal shelter", "dog"]
+  },
+  {
+    "id": "doc_008",
+    "text": "Hector builds microservices with Go and deploys them on Kubernetes in production.",
+    "user_id": "hector",
+    "category": "tech",
+    "tags": ["go", "kubernetes", "microservices", "devops"]
+  },
+  {
+    "id": "doc_009",
+    "text": "Iris is passionate about deep learning research and recently published a paper on transformers.",
+    "user_id": "iris",
+    "category": "tech",
+    "tags": ["deep learning", "transformers", "research", "AI"]
+  },
+  {
+    "id": "doc_010",
+    "text": "Jack meal-preps every Sunday and loves cooking high-protein recipes for the week.",
+    "user_id": "jack",
+    "category": "food",
+    "tags": ["meal prep", "high protein", "cooking", "fitness"]
+  }
+]
