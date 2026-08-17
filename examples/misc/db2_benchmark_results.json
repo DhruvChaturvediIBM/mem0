@@ -1,0 +1,223 @@
+{
+  "meta": {
+    "users": 4,
+    "conversations": 8,
+    "queries": 9,
+    "llm": "llama3.2",
+    "embedder": "nomic-embed-text",
+    "vector_store": "Db2VectorStore (IBM Db2 COSINE)",
+    "tokenizer": "tiktoken cl100k_base"
+  },
+  "ingestion": {
+    "ingestion_tokens": 226,
+    "ingestion_latency_ms": 14744.1,
+    "total_memories": 16
+  },
+  "grand_totals": {
+    "total_without": 1357,
+    "total_with": 665,
+    "total_saved": 692,
+    "total_saved_pct": 51.0,
+    "avg_precision": 0.37,
+    "avg_recall": 0.82,
+    "by_level": {
+      "BASIC": {
+        "avg_without": 117.7,
+        "avg_with": 69.0,
+        "avg_saved": 48.7,
+        "avg_saved_pct": 41.4,
+        "avg_precision": 0.33,
+        "avg_recall": 1.0
+      },
+      "MEDIUM": {
+        "avg_without": 117.7,
+        "avg_with": 79.3,
+        "avg_saved": 38.3,
+        "avg_saved_pct": 32.6,
+        "avg_precision": 0.44,
+        "avg_recall": 0.89
+      },
+      "COMPLEX": {
+        "avg_without": 217.0,
+        "avg_with": 73.3,
+        "avg_saved": 143.7,
+        "avg_saved_pct": 66.2,
+        "avg_precision": 0.33,
+        "avg_recall": 0.58
+      }
+    }
+  },
+  "results": [
+    {
+      "id": "B1",
+      "complexity": "BASIC",
+      "text": "What pet does Alice have?",
+      "description": "Direct pet ownership lookup",
+      "without_tokens": 117,
+      "with_tokens": 74,
+      "saved_tokens": 43,
+      "saved_pct": 36.8,
+      "latency_ms": 53.8,
+      "precision_at_3": 0.33,
+      "recall_at_3": 1.0,
+      "retrieved": [
+        "User has a golden retriever puppy named Max who loves fetch and is three months old",
+        "User eats vegetarian food and is allergic to nuts",
+        "User works as a UX designer at a healthcare startup in San Francisco designing patient-facing apps on weekends"
+      ],
+      "top_score": 0.5747
+    },
+    {
+      "id": "B2",
+      "complexity": "BASIC",
+      "text": "What programming language is Charlie learning?",
+      "description": "Single fact \u2014 language learning",
+      "without_tokens": 120,
+      "with_tokens": 70,
+      "saved_tokens": 50,
+      "saved_pct": 41.7,
+      "latency_ms": 48.9,
+      "precision_at_3": 0.33,
+      "recall_at_3": 1.0,
+      "retrieved": [
+        "User is learning Rust for systems programming with a focus on memory safety",
+        "User is building a small game engine and contributes to open-source projects",
+        "User is training for a marathon and tracks their runs with a GPS watch"
+      ],
+      "top_score": 0.5872
+    },
+    {
+      "id": "B3",
+      "complexity": "BASIC",
+      "text": "What does Bob do for work?",
+      "description": "Occupation lookup",
+      "without_tokens": 116,
+      "with_tokens": 63,
+      "saved_tokens": 53,
+      "saved_pct": 45.7,
+      "latency_ms": 55.8,
+      "precision_at_3": 0.33,
+      "recall_at_3": 1.0,
+      "retrieved": [
+        "User is a senior Python engineer at a fintech startup",
+        "User trains online for chess on chess.com",
+        "User plays chess competitively and recently reached an Elo of 1800"
+      ],
+      "top_score": 0.4532
+    },
+    {
+      "id": "M1",
+      "complexity": "MEDIUM",
+      "text": "What cloud-native technologies does Diana work with?",
+      "description": "Category match \u2014 cloud/k8s tech",
+      "without_tokens": 113,
+      "with_tokens": 87,
+      "saved_tokens": 26,
+      "saved_pct": 23.0,
+      "latency_ms": 50.3,
+      "precision_at_3": 0.33,
+      "recall_at_3": 1.0,
+      "retrieved": [
+        "User does deep learning research and recently published a paper on transformers at NeurIPS, which is also their area of interest",
+        "User builds microservices in Go and deploys them on Kubernetes in production, using Helm and Argo CD for management",
+        "User volunteers at an animal shelter on weekends"
+      ],
+      "top_score": 0.5818
+    },
+    {
+      "id": "M2",
+      "complexity": "MEDIUM",
+      "text": "What fitness and health activities does Charlie do?",
+      "description": "Multi-fact \u2014 fitness category",
+      "without_tokens": 122,
+      "with_tokens": 76,
+      "saved_tokens": 46,
+      "saved_pct": 37.7,
+      "latency_ms": 46.5,
+      "precision_at_3": 0.67,
+      "recall_at_3": 0.67,
+      "retrieved": [
+        "User has been training for three months and meal-preps high-protein food every Sunday",
+        "User is training for a marathon and tracks their runs with a GPS watch",
+        "User is building a small game engine and contributes to open-source projects"
+      ],
+      "top_score": 0.5612
+    },
+    {
+      "id": "M3",
+      "complexity": "MEDIUM",
+      "text": "What are Alice's dietary restrictions?",
+      "description": "Dietary preference lookup",
+      "without_tokens": 118,
+      "with_tokens": 75,
+      "saved_tokens": 43,
+      "saved_pct": 36.4,
+      "latency_ms": 43.0,
+      "precision_at_3": 0.33,
+      "recall_at_3": 1.0,
+      "retrieved": [
+        "User eats vegetarian food and is allergic to nuts",
+        "User has a golden retriever puppy named Max who loves fetch and is three months old",
+        "User works as a UX designer at a healthcare startup in San Francisco designing patient-facing apps on weekends"
+      ],
+      "top_score": 0.5468
+    },
+    {
+      "id": "C1",
+      "complexity": "COMPLEX",
+      "text": "Who would be best to discuss neural networks and AI research with?",
+      "description": "Semantic inference \u2014 ML research",
+      "without_tokens": 117,
+      "with_tokens": 74,
+      "saved_tokens": 43,
+      "saved_pct": 36.8,
+      "latency_ms": 45.9,
+      "precision_at_3": 0.33,
+      "recall_at_3": 1.0,
+      "retrieved": [
+        "User does deep learning research and recently published a paper on transformers at NeurIPS, which is also their area of interest",
+        "User volunteers at an animal shelter on weekends",
+        "User runs a vegetarian cooking blog"
+      ],
+      "top_score": 0.6767
+    },
+    {
+      "id": "C2",
+      "complexity": "COMPLEX",
+      "text": "What evidence is there that Bob combines technical expertise with non-work hobbies?",
+      "description": "Cross-domain \u2014 tech + hobbies",
+      "without_tokens": 123,
+      "with_tokens": 68,
+      "saved_tokens": 55,
+      "saved_pct": 44.7,
+      "latency_ms": 46.1,
+      "precision_at_3": 0.67,
+      "recall_at_3": 0.75,
+      "retrieved": [
+        "User is a senior Python engineer at a fintech startup",
+        "User enjoys reading sci-fi novels",
+        "User plays chess competitively and recently reached an Elo of 1800"
+      ],
+      "top_score": 0.5015
+    },
+    {
+      "id": "C3",
+      "complexity": "COMPLEX",
+      "text": "Who combines software engineering with a healthy lifestyle or outdoor activities?",
+      "description": "Cross-domain \u2014 tech + fitness/outdoor",
+      "without_tokens": 411,
+      "with_tokens": 78,
+      "saved_tokens": 333,
+      "saved_pct": 81.0,
+      "latency_ms": 39.9,
+      "precision_at_3": 0.0,
+      "recall_at_3": 0.0,
+      "retrieved": [
+        "User is building a small game engine and contributes to open-source projects",
+        "User works as a UX designer at a healthcare startup in San Francisco designing patient-facing apps on weekends",
+        "User is a senior Python engineer at a fintech startup"
+      ],
+      "top_score": 0.6558
+    }
+  ]
+}

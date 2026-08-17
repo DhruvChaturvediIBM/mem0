@@ -254,7 +254,11 @@ class Db2VectorStore(VectorStoreBase):
             List of :class:`OutputData` ordered by ascending distance
             (highest similarity first).
         """
-        embedding = vectors[0] if vectors else []
+        # Handle both list[list[float]] (our examples) and list[float] (Memory internal calls)
+        if vectors and isinstance(vectors[0], (int, float)):
+            embedding = vectors          # already a flat vector
+        else:
+            embedding = vectors[0] if vectors else []
         embedding_len = len(embedding) if embedding else self._embedding_dim
 
         where_clause = self._where_clause(filters)
