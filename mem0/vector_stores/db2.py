@@ -93,8 +93,11 @@ def _create_table_if_not_exists(
     cursor = client.cursor()
     try:
         cursor.execute(ddl)
-        cursor.execute("COMMIT")
+        client.commit()
         logger.info("Table %s created.", table_name)
+    except Exception:
+        client.rollback()
+        raise
     finally:
         cursor.close()
 
@@ -139,13 +142,15 @@ class Db2VectorStore(VectorStoreBase):
             cp = self.config.connection_params or {}
             conn_str = (
                 f"DATABASE={cp.get('database')};"
-                f"hostname={cp.get('host')};"
-                f"port={cp.get('port', 50000)};"
-                f"uid={cp.get('username')};"
-                f"pwd={cp.get('password')};"
+                f"HOSTNAME={cp.get('host')};"
+                f"PORT={cp.get('port', 50000)};"
+                f"PROTOCOL=TCPIP;"
+                f"UID={cp.get('username')};"
+                f"PWD={cp.get('password')};"
+                f"Authentication=SERVER;"
             )
             if "security" in cp:
-                conn_str += f"security={cp['security']};"
+                conn_str += f"SECURITY={cp['security']};"
                 ssl_cert = cp.get("ssl_cert", "")
                 if ssl_cert:
                     conn_str += f"SSLServerCertificate={ssl_cert};"
@@ -212,7 +217,12 @@ class Db2VectorStore(VectorStoreBase):
         embedding_len = len(vectors[0]) if vectors else self._embedding_dim
 
         rows = [
-            (hid, str(vec), json.dumps(meta), meta.get("data", ""))
+            (
+                hid,
+                "[" + ", ".join(str(v) for v in vec) + "]",
+                json.dumps(meta),
+                meta.get("data", ""),
+            )
             for hid, vec, meta in zip(hashed_ids, vectors, payloads)
         ]
 
@@ -220,14 +230,16 @@ class Db2VectorStore(VectorStoreBase):
             f"INSERT INTO {self.collection_name} "  # noqa: S608
             f"({self._id_field}, {self._embedding_field}, "
             f"{self._metadata_field}, {self._text_field}) "
-            f"VALUES (?, VECTOR(CAST(? AS CLOB(100000)), {embedding_len}, FLOAT32), "
-            f"SYSTOOLS.JSON2BSON(?), ?)"
+            f"VALUES (?, VECTOR(?, {embedding_len}, FLOAT32), SYSTOOLS.JSON2BSON(?), ?)"
         )
 
         cursor = self.client.cursor()
         try:
             cursor.executemany(sql, rows)
-            cursor.execute("COMMIT")
+            self.client.commit()
+        except Exception:
+            self.client.rollback()
+            raise
         finally:
             cursor.close()
 
@@ -261,6 +273,7 @@ class Db2VectorStore(VectorStoreBase):
             embedding = vectors[0] if vectors else []
         embedding_len = len(embedding) if embedding else self._embedding_dim
 
+        embedding_str = "[" + ", ".join(str(v) for v in embedding) + "]"
         where_clause = self._where_clause(filters)
 
         sql = (
@@ -268,7 +281,7 @@ class Db2VectorStore(VectorStoreBase):
             f"{self._text_field}, "
             f"SYSTOOLS.BSON2JSON({self._metadata_field}), "
             f"VECTOR_DISTANCE({self._embedding_field}, "
-            f"VECTOR('{embedding}', {embedding_len}, FLOAT32), "
+            f"VECTOR('{embedding_str}', {embedding_len}, FLOAT32), "
             f"{self._distance_strategy}) AS distance "
             f"FROM {self.collection_name} "
             f"{where_clause} "
@@ -315,7 +328,10 @@ class Db2VectorStore(VectorStoreBase):
         cursor = self.client.cursor()
         try:
             cursor.execute(sql, [hid])
-            cursor.execute("COMMIT")
+            self.client.commit()
+        except Exception:
+            self.client.rollback()
+            raise
         finally:
             cursor.close()
 
@@ -347,17 +363,17 @@ class Db2VectorStore(VectorStoreBase):
 
         if vector is not None:
             embedding_len = len(vector)
+            vec_str = "[" + ", ".join(str(v) for v in vector) + "]"
             set_parts.append(
                 f"{self._embedding_field} = "
-                f"VECTOR(CAST(? AS CLOB(100000)), {embedding_len}, FLOAT32)"
+                f"VECTOR('{vec_str}', {embedding_len}, FLOAT32)"
             )
-            params.append(str(vector))
 
         if payload is not None:
-            # Update text field from payload["data"] if present
-            if "data" in payload:
-                set_parts.append(f"{self._text_field} = ?")
-                params.append(payload["data"])
+            # Always sync text column — fall back to "" when "data" key is absent
+            # so the stored text never goes stale relative to the metadata.
+            set_parts.append(f"{self._text_field} = ?")
+            params.append(payload.get("data", ""))
             set_parts.append(f"{self._metadata_field} = SYSTOOLS.JSON2BSON(?)")
             params.append(json.dumps(payload))
 
@@ -371,7 +387,10 @@ class Db2VectorStore(VectorStoreBase):
         cursor = self.client.cursor()
         try:
             cursor.execute(sql, params)
-            cursor.execute("COMMIT")
+            self.client.commit()
+        except Exception:
+            self.client.rollback()
+            raise
         finally:
             cursor.close()
 
@@ -431,8 +450,11 @@ class Db2VectorStore(VectorStoreBase):
         cursor = self.client.cursor()
         try:
             cursor.execute(f"DROP TABLE {self.collection_name}")
-            cursor.execute("COMMIT")
+            self.client.commit()
             logger.info("Table %s dropped.", self.collection_name)
+        except Exception:
+            self.client.rollback()
+            raise
         finally:
             cursor.close()
 
@@ -520,28 +542,51 @@ class Db2VectorStore(VectorStoreBase):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _escape_literal(value: str) -> str:
+        """Escape a string value for safe inline use in a SQL string literal.
+
+        ibm_db cannot bind ``?`` parameters in queries that contain
+        ``SYSTOOLS.BSON2JSON`` or ``VECTOR_DISTANCE`` — the same limitation
+        Databricks has with ``ARRAY`` types in ``StatementParameterListItem``.
+        Both drivers handle it identically: inline the value as an escaped
+        SQL string literal. Only the single-quote character needs escaping
+        per the SQL standard (double it: ``'`` → ``''``).
+        """
+        return str(value).replace("'", "''")
+
     def _where_clause(self, filters: Optional[Dict[str, Any]]) -> str:
-        """Build a WHERE clause using the instance's metadata field name.
+        """Build a WHERE clause with safely-escaped inline literals.
+
+        ibm_db cannot bind ``?`` parameters in queries containing
+        ``SYSTOOLS.BSON2JSON`` or ``VECTOR_DISTANCE``, so filter values are
+        always inlined as escaped SQL string literals — the same approach
+        Databricks uses for ``ARRAY`` types that its driver cannot parameterise.
 
         Args:
-            filters: Metadata filter dict (see :meth:`_build_where_clause`).
+            filters: Dict of ``{field: value}`` equality filters. A value of
+                ``"*"`` is treated as "match all" and skips the condition.
+                A list value generates an ``IN (…)`` clause.
 
         Returns:
-            SQL fragment starting with ``WHERE``, or empty string.
+            SQL fragment starting with ``WHERE``, or empty string when no
+            filters apply.
         """
         if not filters:
             return ""
 
-        conditions = []
+        conditions: list[str] = []
+
         for key, value in filters.items():
             if value == "*":
+                # Wildcard — caller wants all values for this field; skip condition.
                 continue
             mf = self._metadata_field
             json_expr = f"JSON_VALUE(SYSTOOLS.BSON2JSON({mf}), '$.{key}')"
             if isinstance(value, list):
-                placeholders = ", ".join(f"'{v}'" for v in value)
-                conditions.append(f"{json_expr} IN ({placeholders})")
+                escaped = ", ".join(f"'{self._escape_literal(v)}'" for v in value)
+                conditions.append(f"{json_expr} IN ({escaped})")
             else:
-                conditions.append(f"{json_expr} = '{value}'")
+                conditions.append(f"{json_expr} = '{self._escape_literal(value)}'")
 
         return ("WHERE " + " AND ".join(conditions)) if conditions else ""
