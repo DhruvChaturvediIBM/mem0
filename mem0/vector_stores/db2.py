@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -12,9 +12,9 @@ from pydantic import BaseModel
 
 try:
     import ibm_db_dbi
-except ImportError as exc:  # pragma: no cover - dependency guard
+except ImportError as exc:  # pragma: no cover - optional dependency guard
     raise ImportError(
-        "The 'ibm_db_dbi' library is required. "
+        "The 'ibm_db_dbi' library is required for the Db2 vector store. "
         "Install it with: pip install ibm_db"
     ) from exc
 
@@ -28,10 +28,28 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _SCORE_FROM_DISTANCE = {
-    "EUCLIDEAN": lambda d: 1.0 / (1.0 + d),
-    "COSINE": lambda d: max(0.0, 1.0 - d),
-    "DOT": lambda d: d,  # dot product is already higher = better; return as-is
+    "EUCLIDEAN":          lambda d: 1.0 / (1.0 + d),
+    "EUCLIDEAN_DISTANCE": lambda d: 1.0 / (1.0 + d),
+    "COSINE":             lambda d: max(0.0, 1.0 - d),
+    "DOT":                lambda d: d,       # higher = more similar, return as-is
+    "HAMMING":            lambda d: 1.0 / (1.0 + d),
+    "MANHATTAN":          lambda d: 1.0 / (1.0 + d),
 }
+
+# DOT product: higher = more similar → ORDER BY DESC.
+# All other metrics: lower distance = more similar → ORDER BY ASC.
+_ORDER_BY_DIRECTION = {
+    "EUCLIDEAN":          "ASC",
+    "EUCLIDEAN_DISTANCE": "ASC",
+    "COSINE":             "ASC",
+    "DOT":                "DESC",
+    "HAMMING":            "ASC",
+    "MANHATTAN":          "ASC",
+}
+
+# Minimum Db2 version required for AI Vector Search.
+# Vector Search was introduced in Db2 12.1.0; 12.1.2 added HAMMING/MANHATTAN.
+_MIN_DB2_VERSION = (12, 1, 2)
 
 
 def _distance_to_score(distance: float, strategy: str) -> float:
@@ -58,16 +76,20 @@ class OutputData(BaseModel):
 
 
 def _table_exists(client: Any, table_name: str) -> bool:
+    """Check table existence via SYSCAT.TABLES — no data scan required."""
+    # Strip any schema prefix or quotes; SYSCAT.TABLES stores bare upper-case names.
+    bare = table_name.strip('"').upper()
+    sql = (
+        "SELECT COUNT(*) FROM SYSCAT.TABLES "  # noqa: S608
+        "WHERE TABNAME = ? AND TABSCHEMA = CURRENT SCHEMA"
+    )
     cursor = client.cursor()
     try:
-        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")  # noqa: S608
-    except Exception as ex:
-        if "SQL0204N" in str(ex):
-            return False
-        raise
+        cursor.execute(sql, [bare])
+        row = cursor.fetchone()
+        return bool(row and row[0] > 0)
     finally:
         cursor.close()
-    return True
 
 
 def _create_table_if_not_exists(
@@ -83,8 +105,10 @@ def _create_table_if_not_exists(
         logger.info("Table %s already exists.", table_name)
         return
 
+    # id_field is VARCHAR(36) to hold standard 36-character UUID strings
+    # produced by str(uuid.uuid4()) — no hashing or truncation needed.
     cols = (
-        f"{id_field} CHAR(16) PRIMARY KEY NOT NULL, "
+        f"{id_field} VARCHAR(36) PRIMARY KEY NOT NULL, "
         f"{text_field} CLOB, "
         f"{metadata_field} BLOB, "
         f"{embedding_field} VECTOR({embedding_dim}, FLOAT32)"
@@ -102,11 +126,6 @@ def _create_table_if_not_exists(
         cursor.close()
 
 
-def _hash_id(raw_id: str) -> str:
-    """Return a 16-character uppercase hex SHA-256 digest suitable for CHAR(16)."""
-    return hashlib.sha256(raw_id.encode()).hexdigest()[:16].upper()
-
-
 # ---------------------------------------------------------------------------
 # Main class
 # ---------------------------------------------------------------------------
@@ -115,7 +134,9 @@ def _hash_id(raw_id: str) -> str:
 class Db2VectorStore(VectorStoreBase):
     """IBM Db2 AI Vector Search vector store.
 
-    Supported ``distance_strategy`` values: ``"EUCLIDEAN"``, ``"COSINE"``, ``"DOT"``.
+    Supported ``distance_strategy`` values:
+    ``"EUCLIDEAN"`` (default), ``"COSINE"``, ``"DOT"``,
+    ``"EUCLIDEAN_DISTANCE"``, ``"HAMMING"``, ``"MANHATTAN"``.
 
     Args:
         collection_name: Db2 table name (created automatically if absent).
@@ -154,7 +175,18 @@ class Db2VectorStore(VectorStoreBase):
                 ssl_cert = cp.get("ssl_cert", "")
                 if ssl_cert:
                     conn_str += f"SSLServerCertificate={ssl_cert};"
-            self.client = ibm_db_dbi.connect(conn_str, "", "")
+            try:
+                self.client = ibm_db_dbi.connect(conn_str, "", "")
+            except Exception as exc:
+                # Mask the password before surfacing the error so credentials
+                # never appear in logs or tracebacks.
+                safe = re.sub(r"PWD=[^;]*", "PWD=***", conn_str)
+                raise ConnectionError(
+                    f"Db2 connection failed: {exc}  (conn={safe})"
+                ) from exc
+
+        # Version check — fail fast if Db2 is too old for AI Vector Search. --
+        self._check_db2_version()
 
         self.collection_name = self.config.collection_name
         self._text_field = self.config.text_field
@@ -163,6 +195,11 @@ class Db2VectorStore(VectorStoreBase):
         self._embedding_field = self.config.embedding_field
         self._distance_strategy = self.config.distance_strategy
         self._embedding_dim = self.config.embedding_model_dims
+
+        # Probe once at startup whether Db2 Text Search is installed.
+        # Result is cached on self._text_search_available so keyword_search()
+        # pays zero overhead on every call.
+        self._text_search_available: bool = self._probe_text_search()
 
         # Ensure table exists --------------------------------------------------
         _create_table_if_not_exists(
@@ -213,17 +250,16 @@ class Db2VectorStore(VectorStoreBase):
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in range(n)]
 
-        hashed_ids = [_hash_id(i) for i in ids]
         embedding_len = len(vectors[0]) if vectors else self._embedding_dim
 
         rows = [
             (
-                hid,
+                vid,
                 "[" + ", ".join(str(v) for v in vec) + "]",
                 json.dumps(meta),
                 meta.get("data", ""),
             )
-            for hid, vec, meta in zip(hashed_ids, vectors, payloads)
+            for vid, vec, meta in zip(ids, vectors, payloads)
         ]
 
         sql = (
@@ -243,7 +279,7 @@ class Db2VectorStore(VectorStoreBase):
         finally:
             cursor.close()
 
-        return hashed_ids
+        return ids
 
     def search(
         self,
@@ -275,6 +311,7 @@ class Db2VectorStore(VectorStoreBase):
 
         embedding_str = "[" + ", ".join(str(v) for v in embedding) + "]"
         where_clause = self._where_clause(filters)
+        order_dir = _ORDER_BY_DIRECTION[self._distance_strategy]
 
         sql = (
             f"SELECT {self._id_field}, "  # noqa: S608
@@ -285,7 +322,7 @@ class Db2VectorStore(VectorStoreBase):
             f"{self._distance_strategy}) AS distance "
             f"FROM {self.collection_name} "
             f"{where_clause} "
-            f"ORDER BY distance "
+            f"ORDER BY distance {order_dir} "
             f"FETCH FIRST {top_k} ROWS ONLY"
         )
 
@@ -311,23 +348,15 @@ class Db2VectorStore(VectorStoreBase):
         return results
 
     def delete(self, vector_id: str) -> None:
-        """Delete a single vector by its original or hashed ID.
+        """Delete a single vector by ID.
 
         Args:
-            vector_id: The ID as stored (hashed CHAR(16)) or the raw original
-                ID (which will be hashed before lookup).
+            vector_id: The ID as originally passed to ``insert`` (UUID string).
         """
-        import re
-
-        if re.fullmatch(r"[A-F0-9]{16}", vector_id):
-            hid = vector_id
-        else:
-            hid = _hash_id(vector_id)
-
         sql = f"DELETE FROM {self.collection_name} WHERE {self._id_field} = ?"  # noqa: S608
         cursor = self.client.cursor()
         try:
-            cursor.execute(sql, [hid])
+            cursor.execute(sql, [vector_id])
             self.client.commit()
         except Exception:
             self.client.rollback()
@@ -344,17 +373,10 @@ class Db2VectorStore(VectorStoreBase):
         """Update the embedding and/or payload of an existing record.
 
         Args:
-            vector_id: Original or hashed ID of the record to update.
+            vector_id: ID of the record to update (the original UUID).
             vector: New embedding vector. If ``None``, the embedding is not changed.
             payload: New metadata dict. If ``None``, the metadata is not changed.
         """
-        import re
-
-        if re.fullmatch(r"[A-F0-9]{16}", vector_id):
-            hid = vector_id
-        else:
-            hid = _hash_id(vector_id)
-
         if vector is None and payload is None:
             return
 
@@ -377,7 +399,7 @@ class Db2VectorStore(VectorStoreBase):
             set_parts.append(f"{self._metadata_field} = SYSTOOLS.JSON2BSON(?)")
             params.append(json.dumps(payload))
 
-        params.append(hid)
+        params.append(vector_id)
         sql = (
             f"UPDATE {self.collection_name} "  # noqa: S608
             f"SET {', '.join(set_parts)} "
@@ -398,18 +420,11 @@ class Db2VectorStore(VectorStoreBase):
         """Retrieve a single record by ID.
 
         Args:
-            vector_id: Original or hashed ID.
+            vector_id: The original UUID of the record.
 
         Returns:
             :class:`OutputData` if found, otherwise ``None``.
         """
-        import re
-
-        if re.fullmatch(r"[A-F0-9]{16}", vector_id):
-            hid = vector_id
-        else:
-            hid = _hash_id(vector_id)
-
         sql = (
             f"SELECT {self._id_field}, "  # noqa: S608
             f"{self._text_field}, "
@@ -420,7 +435,7 @@ class Db2VectorStore(VectorStoreBase):
 
         cursor = self.client.cursor()
         try:
-            cursor.execute(sql, [hid])
+            cursor.execute(sql, [vector_id])
             row = cursor.fetchone()
         finally:
             cursor.close()
@@ -461,17 +476,20 @@ class Db2VectorStore(VectorStoreBase):
     def col_info(self) -> Dict[str, Any]:
         """Return basic metadata about the collection table.
 
+        Uses a live ``COUNT(*)`` for ``row_count`` — ``SYSCAT.TABLES.CARD``
+        returns ``-1`` until ``RUNSTATS`` is run.
+
         Returns:
-            Dict with keys ``table_name``, ``row_count``, ``schema``.
+            Dict with keys ``schema``, ``table_name``, ``row_count``.
         """
-        sql = (
-            "SELECT TABSCHEMA, TABNAME, CARD "  # noqa: S608
+        cat_sql = (
+            "SELECT TABSCHEMA, TABNAME "  # noqa: S608
             "FROM SYSCAT.TABLES "
             "WHERE TABNAME = UPPER(?) AND TABSCHEMA = CURRENT SCHEMA"
         )
         cursor = self.client.cursor()
         try:
-            cursor.execute(sql, [self.collection_name.strip('"')])
+            cursor.execute(cat_sql, [self.collection_name.strip('"')])
             row = cursor.fetchone()
         finally:
             cursor.close()
@@ -479,10 +497,22 @@ class Db2VectorStore(VectorStoreBase):
         if row is None:
             raise ValueError(f"Collection '{self.collection_name}' not found.")
 
+        schema, table_name = row[0], row[1]
+
+        # Live count — avoids the stale -1 from SYSCAT.CARD
+        count_sql = f"SELECT COUNT(*) FROM {self.collection_name}"  # noqa: S608
+        cursor = self.client.cursor()
+        try:
+            cursor.execute(count_sql)
+            count_row = cursor.fetchone()
+            row_count = count_row[0] if count_row else 0
+        finally:
+            cursor.close()
+
         return {
-            "schema": row[0],
-            "table_name": row[1],
-            "row_count": row[2],
+            "schema": schema,
+            "table_name": table_name,
+            "row_count": row_count,
         }
 
     def list(
@@ -538,9 +568,180 @@ class Db2VectorStore(VectorStoreBase):
             self._embedding_field,
         )
 
+    def keyword_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        filters: Optional[Dict] = None,
+    ) -> Optional[List[OutputData]]:
+        """Full-text keyword search using Db2 Text Search (``CONTAINS()``).
+
+        Only available when Db2 Text Search is installed **and** a text index
+        exists on the collection table's ``text`` column.  If either condition
+        is not met this method returns ``None`` — mem0 then falls back to
+        semantic-only search automatically (same behaviour as Chroma, Faiss,
+        Redis, etc.).
+
+        A text index can be created with::
+
+            CALL SYSPROC.SYSTS_CREATE(
+                CURRENT SCHEMA, '<TABLE>', 'text',
+                'MAXIMUM CHARACTERS 10000 LANGUAGE EN FORMAT NONE'
+            );
+
+        Args:
+            query: The (lemmatized) search query text.
+            top_k: Maximum number of results to return.
+            filters: Optional equality filters on metadata fields.
+
+        Returns:
+            List of :class:`OutputData` ordered by relevance score descending,
+            or ``None`` if Db2 Text Search is not available.
+        """
+        if not self._text_search_available:
+            return None
+
+        where_clause = self._where_clause(filters)
+        # Prepend AND when _where_clause already produced a WHERE clause so
+        # the CONTAINS() predicate joins correctly; start a fresh WHERE
+        # when there are no metadata filters.
+        if where_clause:
+            text_pred = f"AND CONTAINS({self._text_field}, '{self._escape_literal(query)}') = 1"
+        else:
+            text_pred = f"WHERE CONTAINS({self._text_field}, '{self._escape_literal(query)}') = 1"
+
+        # SCORE() returns Db2 Text Search relevance rank (0–100 float).
+        sql = (
+            f"SELECT {self._id_field}, "  # noqa: S608
+            f"{self._text_field}, "
+            f"SYSTOOLS.BSON2JSON({self._metadata_field}), "
+            f"SCORE({self._text_field}, '{self._escape_literal(query)}') AS relevance "
+            f"FROM {self.collection_name} "
+            f"{where_clause} "
+            f"{text_pred} "
+            f"ORDER BY relevance DESC "
+            f"FETCH FIRST {top_k} ROWS ONLY"
+        )
+
+        cursor = self.client.cursor()
+        results = []
+        try:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            for row in rows:
+                metadata = json.loads(row[2] if row[2] is not None else "{}")
+                score = float(row[3]) / 100.0  # normalise 0-100 → 0.0-1.0
+                results.append(OutputData(id=row[0], score=score, payload=metadata))
+        except Exception as exc:
+            # Text Search index may have been dropped since startup probe.
+            # Return None so mem0 falls back to semantic search gracefully.
+            logger.debug(
+                "keyword_search() fell back to None (Text Search unavailable): %s", exc
+            )
+            return None
+        finally:
+            cursor.close()
+
+        return results
+
+    def close(self) -> None:
+        """Close the underlying database connection.
+
+        Call this when you are done with the store to release the connection
+        back to the Db2 server.  After calling ``close()`` the instance must
+        not be used again.
+        """
+        try:
+            self.client.close()
+            logger.debug("Db2 connection closed.")
+        except Exception:
+            pass
+
+    def __del__(self) -> None:
+        """Best-effort connection cleanup on garbage collection."""
+        try:
+            self.client.close()
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _probe_text_search(self) -> bool:
+        """Return ``True`` if Db2 Text Search is active on this database.
+
+        ``SYSTS_CREATE`` and friends exist in ``SYSCAT.PROCEDURES`` as catalogue
+        stubs on every Db2 12.1 installation regardless of whether Text Search
+        has actually been enabled.  The only reliable test is to attempt a real
+        ``CONTAINS()`` call — it raises ``SQL21000N`` when the feature is not
+        active, and succeeds (returning 0 or 1) when it is.
+
+        We run ``CONTAINS()`` against a trivial ``VALUES`` subquery so no real
+        table permission is needed and the query completes instantly.
+        """
+        sql = "SELECT CONTAINS(v, 'probe') FROM (VALUES ('probe text')) AS t(v)"  # noqa: S608
+        cursor = self.client.cursor()
+        available = False
+        try:
+            cursor.execute(sql)
+            cursor.fetchone()
+            available = True
+        except Exception:
+            # SQL21000N → Text Search not configured; any other error → treat
+            # as unavailable so startup never fails.
+            available = False
+        finally:
+            cursor.close()
+
+        if available:
+            logger.info(
+                "Db2 Text Search detected — keyword_search() enabled for %s.",
+                self.collection_name,
+            )
+        else:
+            logger.debug(
+                "Db2 Text Search not installed/configured — keyword_search() will "
+                "return None (mem0 will use semantic-only search)."
+            )
+        return available
+
+    def _check_db2_version(self) -> None:
+        """Raise ``RuntimeError`` if the connected Db2 is below ``_MIN_DB2_VERSION``.
+
+        AI Vector Search requires Db2 12.1.0+.  HAMMING and MANHATTAN distance
+        functions were added in 12.1.2.  Failing fast here gives a clear error
+        message rather than an obscure SQL function-not-found error later.
+        """
+        sql = "SELECT SERVICE_LEVEL FROM SYSIBMADM.ENV_INST_INFO"  # noqa: S608
+        cursor = self.client.cursor()
+        try:
+            cursor.execute(sql)
+            row = cursor.fetchone()
+        finally:
+            cursor.close()
+
+        if row is None:
+            logger.warning("Could not determine Db2 version — proceeding anyway.")
+            return
+
+        # SERVICE_LEVEL looks like "DB2 v12.1.5.0" — parse the vX.Y.Z.P part.
+        raw = str(row[0])
+        m = re.search(r"v?(\d+)\.(\d+)\.(\d+)", raw)
+        if m is None:
+            logger.warning("Could not parse Db2 version from %r — proceeding anyway.", raw)
+            return
+
+        actual = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if actual < _MIN_DB2_VERSION:
+            req = ".".join(str(x) for x in _MIN_DB2_VERSION)
+            act = ".".join(str(x) for x in actual)
+            raise RuntimeError(
+                f"IBM Db2 {req}+ is required for AI Vector Search "
+                f"(connected server reports {act}).  "
+                f"Please upgrade your Db2 instance."
+            )
+        logger.debug("Db2 version check passed: %s", raw.strip())
 
     @staticmethod
     def _escape_literal(value: str) -> str:
@@ -564,9 +765,32 @@ class Db2VectorStore(VectorStoreBase):
         Databricks uses for ``ARRAY`` types that its driver cannot parameterise.
 
         Args:
-            filters: Dict of ``{field: value}`` equality filters. A value of
-                ``"*"`` is treated as "match all" and skips the condition.
-                A list value generates an ``IN (…)`` clause.
+            filters: Dict of ``{field: value}`` equality filters.
+
+            Supported value forms:
+
+            * Scalar string/int/bool — equality: ``{"user_id": "alice"}``
+            * ``"*"`` — wildcard, match any value (condition skipped)
+            * List — ``IN`` clause: ``{"user_id": ["alice", "bob"]}``
+            * Dict with operator keys:
+
+              +---------+----------------------------------------------+
+              | ``eq``  | equal (same as scalar shorthand)             |
+              +---------+----------------------------------------------+
+              | ``ne``  | not equal                                    |
+              +---------+----------------------------------------------+
+              | ``gt``  | greater than (numeric cast)                  |
+              +---------+----------------------------------------------+
+              | ``gte`` | greater than or equal (numeric cast)         |
+              +---------+----------------------------------------------+
+              | ``lt``  | less than (numeric cast)                     |
+              +---------+----------------------------------------------+
+              | ``lte`` | less than or equal (numeric cast)            |
+              +---------+----------------------------------------------+
+              | ``in``  | value in list                                |
+              +---------+----------------------------------------------+
+              | ``nin`` | value not in list                            |
+              +---------+----------------------------------------------+
 
         Returns:
             SQL fragment starting with ``WHERE``, or empty string when no
@@ -578,15 +802,67 @@ class Db2VectorStore(VectorStoreBase):
         conditions: list[str] = []
 
         for key, value in filters.items():
-            if value == "*":
-                # Wildcard — caller wants all values for this field; skip condition.
-                continue
             mf = self._metadata_field
             json_expr = f"JSON_VALUE(SYSTOOLS.BSON2JSON({mf}), '$.{key}')"
-            if isinstance(value, list):
+
+            if value == "*":
+                # Wildcard — match any value; skip condition entirely.
+                continue
+
+            if isinstance(value, dict):
+                # Operator-dict form: {"field": {"gte": 18, "lte": 65}}
+                for op, op_val in value.items():
+                    cond = self._op_condition(json_expr, op, op_val)
+                    if cond:
+                        conditions.append(cond)
+
+            elif isinstance(value, list):
+                # List shorthand → IN clause
                 escaped = ", ".join(f"'{self._escape_literal(v)}'" for v in value)
                 conditions.append(f"{json_expr} IN ({escaped})")
+
             else:
+                # Scalar equality shorthand
                 conditions.append(f"{json_expr} = '{self._escape_literal(value)}'")
 
         return ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    @staticmethod
+    def _op_condition(json_expr: str, op: str, value: Any) -> str:
+        """Translate a single operator dict entry into a SQL condition fragment.
+
+        All values are inlined as escaped literals (ibm_db cannot bind ``?``
+        params alongside ``BSON2JSON``/``VECTOR_DISTANCE`` — see Phase 1 Fix 6).
+
+        Numeric operators (gt, gte, lt, lte) cast the JSON string value to
+        DOUBLE so comparisons work correctly for integer/float metadata.
+        """
+        op = op.lower()
+        esc = Db2VectorStore._escape_literal
+
+        if op == "eq":
+            return f"{json_expr} = '{esc(value)}'"
+        if op == "ne":
+            return f"{json_expr} <> '{esc(value)}'"
+        if op == "gt":
+            return f"CAST({json_expr} AS DOUBLE) > {float(value)}"
+        if op == "gte":
+            return f"CAST({json_expr} AS DOUBLE) >= {float(value)}"
+        if op == "lt":
+            return f"CAST({json_expr} AS DOUBLE) < {float(value)}"
+        if op == "lte":
+            return f"CAST({json_expr} AS DOUBLE) <= {float(value)}"
+        if op == "in":
+            if not isinstance(value, list):
+                raise ValueError(f"Filter operator 'in' requires a list, got {type(value).__name__}")
+            escaped = ", ".join(f"'{esc(v)}'" for v in value)
+            return f"{json_expr} IN ({escaped})"
+        if op == "nin":
+            if not isinstance(value, list):
+                raise ValueError(f"Filter operator 'nin' requires a list, got {type(value).__name__}")
+            escaped = ", ".join(f"'{esc(v)}'" for v in value)
+            return f"{json_expr} NOT IN ({escaped})"
+        raise ValueError(
+            f"Unsupported filter operator '{op}'. "
+            f"Supported: eq, ne, gt, gte, lt, lte, in, nin"
+        )

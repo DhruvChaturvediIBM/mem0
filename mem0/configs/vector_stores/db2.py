@@ -34,11 +34,14 @@ class Db2Config(BaseModel):
     embedding_model_dims: int = Field(1536, description="Dimension of the embedding vectors", gt=0)
     distance_strategy: str = Field(
         "EUCLIDEAN",
-        description="Distance function: EUCLIDEAN, COSINE, or DOT",
+        description=(
+            "Distance function: EUCLIDEAN (default), COSINE, DOT, "
+            "EUCLIDEAN_DISTANCE, HAMMING, or MANHATTAN"
+        ),
     )
 
     text_field: str = Field("text", description="Column name for the raw text (CLOB)")
-    id_field: str = Field("id", description="Column name for the primary key (CHAR 16)")
+    id_field: str = Field("id", description="Column name for the primary key (VARCHAR 36)")
     metadata_field: str = Field("metadata", description="Column name for JSON metadata (BLOB)")
     embedding_field: str = Field("embedding", description="Column name for the vector (FLOAT32)")
 
@@ -46,7 +49,7 @@ class Db2Config(BaseModel):
     def _require_connection(self) -> "Db2Config":
         if self.client is None and not self.connection_params:
             raise ValueError("Either `client` or `connection_params` must be provided.")
-        valid = {"EUCLIDEAN", "COSINE", "DOT"}
+        valid = {"EUCLIDEAN", "COSINE", "DOT", "EUCLIDEAN_DISTANCE", "HAMMING", "MANHATTAN"}
         if self.distance_strategy.upper() not in valid:
             raise ValueError(f"`distance_strategy` must be one of {valid}; got '{self.distance_strategy}'")
         self.distance_strategy = self.distance_strategy.upper()
