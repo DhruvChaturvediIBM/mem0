@@ -4,6 +4,10 @@ from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+# Distance metrics supported by the Db2 ANN vector index.
+# HAMMING, MANHATTAN, and DOT use exact scan — ANN index not available for them.
+_ANN_SUPPORTED_METRICS = {"COSINE", "EUCLIDEAN", "EUCLIDEAN_DISTANCE"}
+
 
 class Db2Config(BaseModel):
     """Configuration required to connect to an IBM Db2 database with vector search enabled.
@@ -13,12 +17,22 @@ class Db2Config(BaseModel):
 
     ``connection_params`` keys:
         database (str): Db2 database name.
-        host (str): Hostname or IP of the Db2 server.
+        host (str): Hostname or IP of the Db2 server.  Mapped to the ibm_db
+            connection-string keyword ``HOSTNAME`` (not ``HOST``) when the
+            connection string is built internally.
         port (str | int): Port number (default ``50000``).
-        username (str): Db2 user.
-        password (str): Db2 password.
-        security (bool, optional): Enable SSL/TLS.
+        username (str): Db2 user.  Mapped to the ibm_db keyword ``UID``.
+        password (str): Db2 password.  Mapped to the ibm_db keyword ``PWD``.
+        security (bool, optional): Enable SSL/TLS.  Mapped to ``SECURITY=SSL``.
         ssl_cert (str, optional): Path to the server certificate (.arm/.pem).
+            Mapped to ``SSLServerCertificate``.
+
+    Connection pooling note:
+        ``ibm_db_dbi`` does not ship a built-in connection pool.  For
+        multi-threaded / web-server deployments, manage a pool externally
+        (e.g. SQLAlchemy with the ``ibm_db_sa`` dialect, or a custom
+        ``threading.local`` wrapper) and pass the per-request connection via
+        the ``client`` parameter rather than using ``connection_params``.
     """
 
     client: Optional[Any] = Field(
@@ -40,7 +54,31 @@ class Db2Config(BaseModel):
         ),
     )
 
+    use_vector_index: bool = Field(
+        False,
+        description=(
+            "Create a native Db2 ANN vector index (CREATE VECTOR INDEX) for "
+            "approximate nearest-neighbour search.  Requires Db2 12.1.5+.  "
+            "Only compatible with COSINE, EUCLIDEAN, and EUCLIDEAN_DISTANCE — "
+            "not HAMMING, MANHATTAN, or DOT.  Defaults to False (exact scan, "
+            "works on all versions >= 12.1.2).  "
+            "PRODUCTION DEPLOYMENTS ONLY: requires Db2 Standard/Advanced "
+            "Edition or Db2 on IBM Cloud/watsonx.data.  Do NOT use with Db2 "
+            "Community Edition (CE) containers (Podman/Docker) — CE drops TCP "
+            "connections after CREATE VECTOR INDEX due to in-memory ANN graph "
+            "reconstruction.  Keep False (the default) on CE containers."
+        ),
+    )
+
     text_field: str = Field("text", description="Column name for the raw text (CLOB)")
+    text_lemmatized_field: str = Field(
+        "text_lemmatized",
+        description=(
+            "Column name for pre-processed (stemmed/lemmatized) text (CLOB). "
+            "Populated from payload['text_lemmatized'] on insert/update. "
+            "Used by keyword_search() with Db2 Text Search for higher recall."
+        ),
+    )
     id_field: str = Field("id", description="Column name for the primary key (VARCHAR 36)")
     metadata_field: str = Field("metadata", description="Column name for JSON metadata (BLOB)")
     embedding_field: str = Field("embedding", description="Column name for the vector (FLOAT32)")
@@ -49,10 +87,23 @@ class Db2Config(BaseModel):
     def _require_connection(self) -> "Db2Config":
         if self.client is None and not self.connection_params:
             raise ValueError("Either `client` or `connection_params` must be provided.")
+
         valid = {"EUCLIDEAN", "COSINE", "DOT", "EUCLIDEAN_DISTANCE", "HAMMING", "MANHATTAN"}
         if self.distance_strategy.upper() not in valid:
             raise ValueError(f"`distance_strategy` must be one of {valid}; got '{self.distance_strategy}'")
         self.distance_strategy = self.distance_strategy.upper()
+
+        # ANN index is only supported for COSINE, EUCLIDEAN, EUCLIDEAN_DISTANCE.
+        # Reject at config time so the user gets a clear message before any SQL runs.
+        if self.use_vector_index and self.distance_strategy not in _ANN_SUPPORTED_METRICS:
+            raise ValueError(
+                f"use_vector_index=True is not compatible with "
+                f"distance_strategy='{self.distance_strategy}'. "
+                f"The Db2 ANN index only supports COSINE, EUCLIDEAN, and "
+                f"EUCLIDEAN_DISTANCE. Set use_vector_index=False for "
+                f"{self.distance_strategy}."
+            )
+
         return self
 
     @model_validator(mode="before")
