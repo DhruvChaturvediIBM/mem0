@@ -23,7 +23,7 @@ class Db2Config(BaseModel):
         port (str | int): Port number (default ``50000``).
         username (str): Db2 user.  Mapped to the ibm_db keyword ``UID``.
         password (str): Db2 password.  Mapped to the ibm_db keyword ``PWD``.
-        security (bool, optional): Enable SSL/TLS.  Mapped to ``SECURITY=SSL``.
+        security (str, optional): SSL/TLS mode string, e.g. ``"SSL"``.  Mapped to ``SECURITY=<value>``.
         ssl_cert (str, optional): Path to the server certificate (.arm/.pem).
             Mapped to ``SSLServerCertificate``.
 

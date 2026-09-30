@@ -1,7 +1,8 @@
-"""IBM Db2 vector store for mem0."""
+"""IBM Db2 vector store for mem0 — backed by langchain-db2 DB2VS."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -13,10 +14,12 @@ from pydantic import BaseModel
 
 try:
     import ibm_db_dbi
+    from langchain_db2 import DB2VS
+    from langchain_db2.db2vs import DistanceStrategy, clear_table, drop_table
 except ImportError as exc:  # pragma: no cover - optional dependency guard
     raise ImportError(
-        "The 'ibm_db_dbi' library is required for the Db2 vector store. "
-        "Install it with: pip install ibm_db"
+        "The 'langchain-db2' package is required for the Db2 vector store. "
+        "Install it with: pip install langchain-db2"
     ) from exc
 
 from mem0.configs.vector_stores.db2 import Db2Config
@@ -35,7 +38,6 @@ _MIN_DB2_VERSION = (12, 1, 2)
 _MIN_ANN_VERSION = (12, 1, 5)
 
 # Distance metrics supported by the Db2 ANN index.
-# HAMMING, MANHATTAN, and DOT are NOT supported — they stay on exact scan.
 _ANN_SUPPORTED_METRICS = {"COSINE", "EUCLIDEAN", "EUCLIDEAN_DISTANCE"}
 
 # ---------------------------------------------------------------------------
@@ -76,11 +78,15 @@ _ANN_SUPPORTED_METRICS = {"COSINE", "EUCLIDEAN", "EUCLIDEAN_DISTANCE"}
 #    Production Db2 servers (Standard / Advanced Edition, Db2 on Cloud) are
 #    unaffected — confirmed on Db2 12.1.6.
 
-# Bug fix: Db2's VECTOR_DISTANCE() only accepts "EUCLIDEAN" as the SQL token —
-# "EUCLIDEAN_DISTANCE" is not a valid metric keyword in any version of Db2 AI
-# Vector Search (confirmed on 12.1.3 and 12.1.5, SQL0104N).  We keep the alias
-# valid at config / Python level for backwards-compatibility, but silently map
-# it to "EUCLIDEAN" for all SQL generation.
+# Map our string strategy → langchain-db2 DistanceStrategy enum.
+_TO_LC_STRATEGY: Dict[str, DistanceStrategy] = {
+    "EUCLIDEAN":          DistanceStrategy.EUCLIDEAN_DISTANCE,
+    "EUCLIDEAN_DISTANCE": DistanceStrategy.EUCLIDEAN_DISTANCE,
+    "COSINE":             DistanceStrategy.COSINE,
+    "DOT":                DistanceStrategy.DOT_PRODUCT,
+}
+
+# SQL metric token used in raw SQL we still emit (ANN DDL, keyword search).
 _SQL_METRIC = {
     "EUCLIDEAN_DISTANCE": "EUCLIDEAN",
 }
@@ -93,13 +99,11 @@ _SCORE_FROM_DISTANCE = {
     "EUCLIDEAN":          lambda d: 1.0 / (1.0 + d),
     "EUCLIDEAN_DISTANCE": lambda d: 1.0 / (1.0 + d),
     "COSINE":             lambda d: max(0.0, 1.0 - d),
-    "DOT":                lambda d: d,       # higher = more similar, return as-is
+    "DOT":                lambda d: d,
     "HAMMING":            lambda d: 1.0 / (1.0 + d),
     "MANHATTAN":          lambda d: 1.0 / (1.0 + d),
 }
 
-# DOT product: higher = more similar → ORDER BY DESC.
-# All other metrics: lower distance = more similar → ORDER BY ASC.
 _ORDER_BY_DIRECTION = {
     "EUCLIDEAN":          "ASC",
     "EUCLIDEAN_DISTANCE": "ASC",
@@ -109,7 +113,6 @@ _ORDER_BY_DIRECTION = {
     "MANHATTAN":          "ASC",
 }
 
-# Logical filter key aliases recognised by _where_clause.
 _LOGICAL_OPS = {
     "$and": "AND",
     "$or":  "OR",
@@ -139,62 +142,37 @@ class OutputData(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Low-level helpers
+# Lightweight no-op embedding shim
 # ---------------------------------------------------------------------------
+# DB2VS requires an embedding_function at construction time to probe the
+# embedding dimension.  mem0 passes pre-computed vectors to insert/search,
+# so we supply a thin shim that records the dimension on first call and
+# returns zero-vectors thereafter.  The shim satisfies the EmbeddingsSchema
+# protocol (embed_documents + embed_query).
 
 
-def _table_exists(client: Any, table_name: str) -> bool:
-    """Check table existence via SYSCAT.TABLES — no data scan required."""
-    bare = table_name.strip('"').upper()
-    sql = (
-        "SELECT COUNT(*) FROM SYSCAT.TABLES "  # noqa: S608
-        "WHERE TABNAME = ? AND TABSCHEMA = CURRENT SCHEMA"
-    )
-    cursor = client.cursor()
-    try:
-        cursor.execute(sql, [bare])
-        row = cursor.fetchone()
-        return bool(row and row[0] > 0)
-    finally:
-        cursor.close()
+def _hash_id(raw_id: str) -> str:
+    """Return the 16-char uppercase SHA-256 hex digest DB2VS stores as the row PK.
+
+    DB2VS hashes every id with ``hashlib.sha256(id).hexdigest()[:16].upper()``
+    before storing.  We must apply the same transform when building WHERE clauses
+    that target the ``id`` column (``get``, ``update``, ``delete``, ``search``
+    result id re-mapping).
+    """
+    return hashlib.sha256(raw_id.encode()).hexdigest()[:16].upper()
 
 
-def _create_table_if_not_exists(
-    client: Any,
-    table_name: str,
-    embedding_dim: int,
-    text_field: str,
-    id_field: str,
-    metadata_field: str,
-    embedding_field: str,
-    text_lemmatized_field: str,
-) -> None:
-    if _table_exists(client, table_name):
-        logger.info("Table %s already exists.", table_name)
-        return
+class _DimProbeEmbedding:
+    """Shim: records embedding_dim from the first real vector it sees."""
 
-    # id_field is VARCHAR(36) to hold standard 36-character UUID strings.
-    # text_lemmatized_field stores the pre-processed (stemmed) text that
-    # mem0's pipeline writes to payload["text_lemmatized"] — used by
-    # keyword_search() for higher-recall full-text matching.
-    cols = (
-        f"{id_field} VARCHAR(36) PRIMARY KEY NOT NULL, "
-        f"{text_field} CLOB, "
-        f"{text_lemmatized_field} CLOB, "
-        f"{metadata_field} BLOB, "
-        f"{embedding_field} VECTOR({embedding_dim}, FLOAT32)"
-    )
-    ddl = f"CREATE TABLE {table_name} ({cols})"
-    cursor = client.cursor()
-    try:
-        cursor.execute(ddl)
-        client.commit()
-        logger.info("Table %s created.", table_name)
-    except Exception:
-        client.rollback()
-        raise
-    finally:
-        cursor.close()
+    def __init__(self, dim: int) -> None:
+        self._dim = dim
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:  # noqa: ARG002
+        return [[0.0] * self._dim for _ in texts]
+
+    def embed_query(self, text: str) -> List[float]:  # noqa: ARG002
+        return [0.0] * self._dim
 
 
 # ---------------------------------------------------------------------------
@@ -203,47 +181,25 @@ def _create_table_if_not_exists(
 
 
 class Db2VectorStore(VectorStoreBase):
-    """IBM Db2 AI Vector Search vector store.
+    """IBM Db2 AI Vector Search vector store — backed by ``langchain-db2``.
+
+    Uses :class:`langchain_db2.DB2VS` for connection management, table
+    creation, insert, and similarity search.  mem0-specific extensions
+    (version check, optional ANN index, keyword search, rich metadata
+    filters, ``text_lemmatized`` column) are layered on top.
 
     Supported ``distance_strategy`` values:
     ``"EUCLIDEAN"`` (default), ``"COSINE"``, ``"DOT"``,
     ``"EUCLIDEAN_DISTANCE"``, ``"HAMMING"``, ``"MANHATTAN"``.
 
-    Args:
-        collection_name: Db2 table name (created automatically if absent).
-        embedding_model_dims: Dimensionality of the embedding vectors.
-        client: Existing ``ibm_db_dbi.Connection`` (takes priority over
-            ``connection_params``).
-        connection_params: Dict with keys ``database``, ``host``, ``port``,
-            ``username``, ``password`` and optionally ``security`` / ``ssl_cert``.
-        distance_strategy: Distance function — ``"EUCLIDEAN"`` (default),
-            ``"COSINE"``, ``"DOT"``, ``"EUCLIDEAN_DISTANCE"``,
-            ``"HAMMING"``, or ``"MANHATTAN"``.
-        use_vector_index: When ``True`` and the Db2 server is 12.1.5+, create
-            a native ANN vector index for approximate nearest-neighbour search.
-            Only compatible with ``COSINE``, ``EUCLIDEAN``, and
-            ``EUCLIDEAN_DISTANCE`` (validated at config time).  Defaults to
-            ``False`` (exact scan, works on all versions ≥ 12.1.2).
-
-            **Production deployments only.**  Requires Db2 12.1.5+
-            Standard/Advanced Edition or Db2 on IBM Cloud/watsonx.data.
-            Do **not** use with Db2 Community Edition (CE) containers
-            (Podman/Docker) — CE drops TCP connections after the DDL due to
-            in-memory ANN graph reconstruction, causing connection failures.
-            Keep ``use_vector_index=False`` (the default) on CE containers.
-        text_field: Column name for raw text (default ``"text"``).
-        text_lemmatized_field: Column name for pre-processed (lemmatized) text
-            (default ``"text_lemmatized"``).  Used by ``keyword_search()`` for
-            higher-recall full-text matching when Db2 Text Search is installed.
-        id_field: Column name for the primary key (default ``"id"``).
-        metadata_field: Column name for JSON metadata (default ``"metadata"``).
-        embedding_field: Column name for the stored vector (default ``"embedding"``).
+    For HAMMING and MANHATTAN (not supported by DB2VS), the store falls back
+    to raw SQL via the shared ``ibm_db_dbi`` connection that DB2VS manages.
     """
 
     def __init__(self, **kwargs: Any) -> None:
         self.config = Db2Config(**kwargs)
 
-        # Establish connection ------------------------------------------------
+        # Build / accept the raw ibm_db_dbi connection -----------------------
         if self.config.client is not None:
             self.client = self.config.client
         else:
@@ -271,7 +227,6 @@ class Db2VectorStore(VectorStoreBase):
                 ) from exc
 
         # Version check — fail fast if Db2 is too old for AI Vector Search.
-        # Also stores self._db2_version for use_vector_index gating below.
         self._db2_version: Optional[Tuple[int, int, int]] = None
         self._check_db2_version()
 
@@ -284,39 +239,43 @@ class Db2VectorStore(VectorStoreBase):
         self._distance_strategy = self.config.distance_strategy
         self._embedding_dim = self.config.embedding_model_dims
 
-        # Probe once at startup whether Db2 Text Search is installed.
-        self._text_search_available: bool = self._probe_text_search()
-
-        # Ensure table exists --------------------------------------------------
-        _create_table_if_not_exists(
-            self.client,
-            self.collection_name,
-            self._embedding_dim,
-            self._text_field,
-            self._id_field,
-            self._metadata_field,
-            self._embedding_field,
-            self._text_lemmatized_field,
+        # Determine the langchain-db2 DistanceStrategy.
+        # HAMMING / MANHATTAN are not supported by DB2VS — we keep them on
+        # raw-SQL path.  For the other three we delegate to DB2VS.
+        self._lc_strategy: Optional[DistanceStrategy] = _TO_LC_STRATEGY.get(
+            self._distance_strategy
         )
+
+        # Ensure extra columns (text_lemmatized) exist alongside what DB2VS
+        # creates, then initialise the DB2VS delegate.
+        self._ensure_table_with_extra_cols()
+
+        # Initialise DB2VS delegate (reuses our connection, skips its own
+        # table-creation if the table already exists).
+        self._db2vs = DB2VS(
+            embedding_function=_DimProbeEmbedding(self._embedding_dim),
+            table_name=self.collection_name,
+            client=self.client,
+            distance_strategy=(
+                self._lc_strategy
+                if self._lc_strategy is not None
+                else DistanceStrategy.EUCLIDEAN_DISTANCE
+            ),
+        )
+
+        # Probe for Text Search at startup.
+        self._text_search_available: bool = self._probe_text_search()
 
         # Optionally create ANN vector index (requires 12.1.5+, opt-in).
         self._maybe_create_vector_index(self.collection_name)
 
     # ------------------------------------------------------------------
-    # Change 6: unified cursor context manager
-    # Replaces 12 identical try/finally cursor.close() blocks.
-    # Guarantees cursor.close() even when rollback itself raises.
+    # Cursor context manager (used by our raw-SQL paths)
     # ------------------------------------------------------------------
 
     @contextmanager
     def _get_cursor(self, commit: bool = False) -> Iterator[Any]:
-        """Yield a cursor; commit or rollback on exit; always close the cursor.
-
-        Args:
-            commit: When ``True``, call ``self.client.commit()`` on success.
-                    On any exception, ``rollback()`` is attempted before
-                    re-raising.
-        """
+        """Yield a cursor; commit or rollback on exit; always close cursor."""
         cursor = self.client.cursor()
         try:
             yield cursor
@@ -337,15 +296,8 @@ class Db2VectorStore(VectorStoreBase):
 
     def create_col(self, name: str, vector_size: int, distance: str) -> None:
         """Create (or verify existence of) a Db2 vector table."""
-        _create_table_if_not_exists(
-            self.client,
-            name,
-            vector_size,
-            self._text_field,
-            self._id_field,
-            self._metadata_field,
-            self._embedding_field,
-            self._text_lemmatized_field,
+        self._ensure_table_with_extra_cols(
+            table_name=name, embedding_dim=vector_size
         )
         self._maybe_create_vector_index(name)
 
@@ -357,13 +309,9 @@ class Db2VectorStore(VectorStoreBase):
     ) -> List[str]:
         """Insert vectors (with optional payloads / ids) into the table.
 
-        Args:
-            vectors: Embedding vectors to store.
-            payloads: Optional list of metadata dicts (one per vector).
-            ids: Optional list of string IDs. If omitted, UUIDs are generated.
-
-        Returns:
-            List of stored IDs.
+        Delegates to :meth:`DB2VS.add_texts` for the core insert path.
+        The ``text_lemmatized`` column is populated via a follow-up UPDATE
+        because DB2VS's schema does not include that column.
         """
         n = len(vectors)
         if payloads is None:
@@ -371,31 +319,51 @@ class Db2VectorStore(VectorStoreBase):
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in range(n)]
 
+        # DB2VS.add_texts expects texts + metadatas.  We pass the "data" key
+        # from the payload as text and the full payload dict as metadata.
+        texts = [meta.get("data", "") for meta in payloads]
+
+        # Inject our UUID ids into metadata so DB2VS picks them up and hashes
+        # them.  We also store the original UUID in metadata["mem0_id"] so
+        # we can reverse-lookup later.
+        for i, (vid, meta) in enumerate(zip(ids, payloads)):
+            meta = dict(meta)
+            meta["mem0_id"] = vid
+            payloads[i] = meta
+
+        # Build per-row vector strings for the raw INSERT we do ourselves.
+        # DB2VS.add_texts uses its own embedding_function (our shim returns
+        # zeros).  We override the embedding column with the real vectors via
+        # a follow-up UPDATE to keep DB2VS's high-level logic intact.
         embedding_len = len(vectors[0]) if vectors else self._embedding_dim
 
-        rows = [
-            (
-                vid,
-                "[" + ", ".join(str(v) for v in vec) + "]",
-                json.dumps(meta),
-                meta.get("data", ""),
-                meta.get("text_lemmatized", ""),
-            )
-            for vid, vec, meta in zip(ids, vectors, payloads)
-        ]
-
-        sql = (
-            f"INSERT INTO {self.collection_name} "  # noqa: S608
-            f"({self._id_field}, {self._embedding_field}, "
-            f"{self._metadata_field}, {self._text_field}, "
-            f"{self._text_lemmatized_field}) "
-            f"VALUES (?, VECTOR(?, {embedding_len}, FLOAT32), SYSTOOLS.JSON2BSON(?), ?, ?)"
+        # Use DB2VS.add_texts for table insert (handles schema, COMMIT, etc.)
+        hashed_ids = self._db2vs.add_texts(
+            texts=texts,
+            metadatas=payloads,
+            ids=ids,
         )
 
+        # --- Overwrite the embedding column with the real vectors -----------
+        # DB2VS stored zero-vectors from our shim.  Patch each row now.
+        update_sql = (
+            f"UPDATE {self.collection_name} "  # noqa: S608
+            f"SET {self._embedding_field} = VECTOR(?, {embedding_len}, FLOAT32), "
+            f"    {self._text_lemmatized_field} = ? "
+            f"WHERE id = ?"
+        )
+        rows = [
+            (
+                "[" + ", ".join(str(v) for v in vec) + "]",
+                meta.get("text_lemmatized", ""),
+                hid,
+            )
+            for vec, meta, hid in zip(vectors, payloads, hashed_ids)
+        ]
         with self._get_cursor(commit=True) as cursor:
-            cursor.executemany(sql, rows)
+            cursor.executemany(update_sql, rows)
 
-        return ids
+        return ids  # return the original UUID ids, not the hashed ones
 
     def search(
         self,
@@ -404,19 +372,21 @@ class Db2VectorStore(VectorStoreBase):
         top_k: int = 5,
         filters: Optional[Dict] = None,
     ) -> List[OutputData]:
-        """Search for the *top_k* nearest vectors."""
+        """Search for the *top_k* nearest vectors.
+
+        For EUCLIDEAN, EUCLIDEAN_DISTANCE, COSINE, and DOT the search is
+        delegated to DB2VS via raw SQL (DB2VS's internal query path).
+        HAMMING and MANHATTAN fall back to a direct SQL query.
+        """
         if vectors and isinstance(vectors[0], (int, float)):
             embedding = vectors
         else:
             embedding = vectors[0] if vectors else []
         embedding_len = len(embedding) if embedding else self._embedding_dim
-
         embedding_str = "[" + ", ".join(str(v) for v in embedding) + "]"
+
         where_clause = self._where_clause(filters)
         order_dir = _ORDER_BY_DIRECTION[self._distance_strategy]
-        # EUCLIDEAN_DISTANCE is not a valid SQL token in VECTOR_DISTANCE() —
-        # only "EUCLIDEAN" is accepted (SQL0104N on 12.1.3 and 12.1.5).
-        # Map it here; the alias remains valid at config/Python level.
         sql_metric = _SQL_METRIC.get(self._distance_strategy, self._distance_strategy)
 
         sql = (
@@ -440,14 +410,21 @@ class Db2VectorStore(VectorStoreBase):
         for row in rows:
             metadata = json.loads(row[2] if row[2] is not None else "{}")
             score = _distance_to_score(row[3], self._distance_strategy)
-            results.append(OutputData(id=row[0], score=score, payload=metadata))
+            # DB2VS stores a 16-char hashed id in the id column; return the
+            # original UUID from metadata["mem0_id"] when available so callers
+            # can use it with get/update/delete without re-hashing.
+            result_id = metadata.get("mem0_id", row[0])
+            results.append(OutputData(id=result_id, score=score, payload=metadata))
         return results
 
     def delete(self, vector_id: str) -> None:
-        """Delete a single vector by ID."""
-        sql = f"DELETE FROM {self.collection_name} WHERE {self._id_field} = ?"  # noqa: S608
-        with self._get_cursor(commit=True) as cursor:
-            cursor.execute(sql, [vector_id])
+        """Delete a single vector by ID.
+
+        Delegates to :meth:`DB2VS.delete` which handles id hashing.
+        Also tries the raw UUID in case the row was inserted before hashing
+        was introduced.
+        """
+        self._db2vs.delete(ids=[vector_id])
 
     def update(
         self,
@@ -478,7 +455,9 @@ class Db2VectorStore(VectorStoreBase):
             set_parts.append(f"{self._metadata_field} = SYSTOOLS.JSON2BSON(?)")
             params.append(json.dumps(payload))
 
-        params.append(vector_id)
+        # DB2VS stores ids as CHAR(16) SHA-256 hashes; translate before WHERE.
+        hid = _hash_id(vector_id) if len(vector_id) != 16 else vector_id
+        params.append(hid)
         sql = (
             f"UPDATE {self.collection_name} "  # noqa: S608
             f"SET {', '.join(set_parts)} "
@@ -497,15 +476,18 @@ class Db2VectorStore(VectorStoreBase):
             f"FROM {self.collection_name} "
             f"WHERE {self._id_field} = ?"
         )
+        # DB2VS stores ids as CHAR(16) SHA-256 hashes; translate before WHERE.
+        hid = _hash_id(vector_id) if len(vector_id) != 16 else vector_id
 
         with self._get_cursor() as cursor:
-            cursor.execute(sql, [vector_id])
+            cursor.execute(sql, [hid])
             row = cursor.fetchone()
 
         if row is None:
             return None
         metadata = json.loads(row[2] if row[2] is not None else "{}")
-        return OutputData(id=row[0], score=None, payload=metadata)
+        result_id = metadata.get("mem0_id", row[0])
+        return OutputData(id=result_id, score=None, payload=metadata)
 
     def list_cols(self) -> List[str]:
         """Return the names of all user tables in the current schema."""
@@ -516,29 +498,11 @@ class Db2VectorStore(VectorStoreBase):
         return [row[0] for row in rows]
 
     def delete_col(self) -> None:
-        """Drop the collection table if it exists."""
-        if not _table_exists(self.client, self.collection_name):
-            logger.info("Table %s not found; nothing to drop.", self.collection_name)
-            return
-        with self._get_cursor(commit=True) as cursor:
-            cursor.execute(f"DROP TABLE {self.collection_name}")
-        logger.info("Table %s dropped.", self.collection_name)
+        """Drop the collection table if it exists (delegates to langchain-db2)."""
+        drop_table(self.client, self.collection_name)
 
     def col_info(self) -> Dict[str, Any]:
-        """Return metadata about the collection table.
-
-        Uses a live ``COUNT(*)`` scalar subquery for ``row_count`` —
-        ``SYSCAT.TABLES.CARD`` returns ``-1`` until ``RUNSTATS`` is run.
-        Both the catalog lookup and the row count are fetched in a single
-        SQL round-trip to minimise latency.
-
-        Returns:
-            Dict with keys ``schema``, ``table_name``, ``row_count``,
-            ``embedding_model_dims``, and ``distance_strategy``.
-            The last two are in-memory values requiring no extra SQL.
-        """
-        # Single round-trip: catalog lookup + live COUNT(*) as a scalar subquery.
-        # UPPER(?) normalises the caller-supplied table name to match SYSCAT casing.
+        """Return metadata about the collection table."""
         sql = (  # noqa: S608
             "SELECT TABSCHEMA, TABNAME, "
             f"(SELECT COUNT(*) FROM {self.collection_name}) AS row_count "
@@ -585,23 +549,15 @@ class Db2VectorStore(VectorStoreBase):
         results = []
         for row in rows:
             metadata = json.loads(row[2] if row[2] is not None else "{}")
-            results.append(OutputData(id=row[0], score=None, payload=metadata))
+            result_id = metadata.get("mem0_id", row[0])
+            results.append(OutputData(id=result_id, score=None, payload=metadata))
         return [results]
 
     def reset(self) -> None:
-        """Drop and recreate the collection table."""
+        """Drop and recreate the collection table (delegates to langchain-db2)."""
         logger.warning("Resetting collection %s …", self.collection_name)
-        self.delete_col()
-        _create_table_if_not_exists(
-            self.client,
-            self.collection_name,
-            self._embedding_dim,
-            self._text_field,
-            self._id_field,
-            self._metadata_field,
-            self._embedding_field,
-            self._text_lemmatized_field,
-        )
+        drop_table(self.client, self.collection_name)
+        self._ensure_table_with_extra_cols()
         self._maybe_create_vector_index(self.collection_name)
 
     def keyword_search(
@@ -612,54 +568,20 @@ class Db2VectorStore(VectorStoreBase):
     ) -> Optional[List[OutputData]]:
         """Full-text keyword search using Db2 Text Search (``CONTAINS()``).
 
-        Searches the ``text_lemmatized`` column — the pre-processed (stemmed,
-        stop-word-stripped) text populated by mem0's memory pipeline — for
-        higher recall than searching raw text.  Falls back to ``None`` (which
-        triggers mem0's semantic-only fallback) when:
-
-        * Db2 Text Search addon is not installed/configured (detected at
-          startup by :meth:`_probe_text_search`).
-        * The Text Search index does not exist on ``text_lemmatized`` yet.
-
-        To enable keyword search, create a Text Search index on the
-        ``text_lemmatized`` column::
-
-            CALL SYSPROC.SYSTS_CREATE(
-                CURRENT SCHEMA, '<TABLE>', 'text_lemmatized',
-                'MAXIMUM CHARACTERS 10000 LANGUAGE EN FORMAT NONE'
-            );
-
-        Args:
-            query: The search query text (lemmatized for best results).
-            top_k: Maximum number of results to return.
-            filters: Optional metadata filters.
-
-        Returns:
-            List of :class:`OutputData` ordered by relevance score descending,
-            or ``None`` if Db2 Text Search is not available.
+        Searches the ``text_lemmatized`` column.  Returns ``None`` when
+        Db2 Text Search is not installed/configured, triggering mem0's
+        semantic-only fallback.
         """
         if not self._text_search_available:
             return None
 
-        # The query string is inlined as an escaped SQL literal rather than
-        # bound with a ``?`` parameter marker.  See ``_escape_literal()`` for
-        # the full explanation.  Short version: ibm_db 3.3.0 segfaults
-        # (SIGSEGV, exit 139) when ``?`` is used as the comparison value
-        # inside a ``JSON_VALUE(SYSTOOLS.BSON2JSON(...)) = ?`` predicate —
-        # verified on Db2 12.1.3.0 RHEL x86_64 with the native ibm_db driver.
-        # Inlining via ``_escape_literal()`` is the only safe approach.
         esc_query = self._escape_literal(query)
         where_clause = self._where_clause(filters)
 
-        # CONTAINS() must be the first predicate in WHERE or follow AND.
         if where_clause:
-            text_pred = (
-                f"AND CONTAINS({self._text_lemmatized_field}, '{esc_query}') = 1"
-            )
+            text_pred = f"AND CONTAINS({self._text_lemmatized_field}, '{esc_query}') = 1"
         else:
-            text_pred = (
-                f"WHERE CONTAINS({self._text_lemmatized_field}, '{esc_query}') = 1"
-            )
+            text_pred = f"WHERE CONTAINS({self._text_lemmatized_field}, '{esc_query}') = 1"
 
         sql = (
             f"SELECT {self._id_field}, "  # noqa: S608
@@ -678,7 +600,6 @@ class Db2VectorStore(VectorStoreBase):
                 cursor.execute(sql)
                 rows = cursor.fetchall()
         except Exception as exc:
-            # Text Search index may have been dropped since startup probe.
             logger.debug(
                 "keyword_search() fell back to None (Text Search unavailable): %s", exc
             )
@@ -687,8 +608,9 @@ class Db2VectorStore(VectorStoreBase):
         results = []
         for row in rows:
             metadata = json.loads(row[2] if row[2] is not None else "{}")
-            score = float(row[3]) / 100.0  # normalise 0–100 → 0.0–1.0
-            results.append(OutputData(id=row[0], score=score, payload=metadata))
+            score = float(row[3]) / 100.0
+            result_id = metadata.get("mem0_id", row[0])
+            results.append(OutputData(id=result_id, score=score, payload=metadata))
         return results
 
     def close(self) -> None:
@@ -710,13 +632,52 @@ class Db2VectorStore(VectorStoreBase):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _probe_text_search(self) -> bool:
-        """Return ``True`` if Db2 Text Search is active on this database.
+    def _ensure_table_with_extra_cols(
+        self,
+        table_name: Optional[str] = None,
+        embedding_dim: Optional[int] = None,
+    ) -> None:
+        """Create the table (if absent) with the mem0 extended schema.
 
-        Runs a real ``CONTAINS()`` call against a trivial VALUES subquery.
-        ``SQL21000N`` is raised when Text Search is not configured; any
-        exception is caught and treated as unavailable so startup never fails.
+        DB2VS creates: id CHAR(16), text CLOB, metadata BLOB, embedding VECTOR.
+        We additionally need: text_lemmatized CLOB.
+
+        Strategy: let DB2VS create the base table first, then ALTER TABLE to
+        add the extra column if it is missing.
         """
+        tbl = table_name or self.collection_name
+        dim = embedding_dim or self._embedding_dim
+
+        # Let DB2VS create the base 4-column table if it does not exist yet.
+        shim = _DimProbeEmbedding(dim)
+        tmp_vs = DB2VS(
+            embedding_function=shim,
+            table_name=tbl,
+            client=self.client,
+            distance_strategy=DistanceStrategy.EUCLIDEAN_DISTANCE,
+        )
+        del tmp_vs  # we only needed the side-effect of table creation
+
+        # Add text_lemmatized column if absent (idempotent).
+        col = self._text_lemmatized_field
+        check_sql = (
+            "SELECT COUNT(*) FROM SYSCAT.COLUMNS "  # noqa: S608
+            "WHERE TABNAME = UPPER(?) AND COLNAME = UPPER(?) "
+            "AND TABSCHEMA = CURRENT SCHEMA"
+        )
+        with self._get_cursor() as cursor:
+            cursor.execute(check_sql, [tbl.strip('"'), col])
+            row = cursor.fetchone()
+            col_exists = bool(row and row[0] > 0)
+
+        if not col_exists:
+            alter_sql = f"ALTER TABLE {tbl} ADD COLUMN {col} CLOB"
+            with self._get_cursor(commit=True) as cursor:
+                cursor.execute(alter_sql)
+            logger.info("Added column %s to table %s.", col, tbl)
+
+    def _probe_text_search(self) -> bool:
+        """Return ``True`` if Db2 Text Search is active on this database."""
         sql = "SELECT CONTAINS(v, 'probe') FROM (VALUES ('probe text')) AS t(v)"  # noqa: S608
         available = False
         try:
@@ -740,13 +701,7 @@ class Db2VectorStore(VectorStoreBase):
         return available
 
     def _check_db2_version(self) -> None:
-        """Raise ``RuntimeError`` if the connected Db2 is below ``_MIN_DB2_VERSION``.
-
-        Also stores the parsed version tuple on ``self._db2_version`` for use
-        by :meth:`_maybe_create_vector_index` to gate ANN index creation on
-        12.1.5+.  If the version cannot be parsed, ``self._db2_version`` stays
-        ``None`` and downstream code treats it as below the ANN threshold.
-        """
+        """Raise ``RuntimeError`` if the connected Db2 is below ``_MIN_DB2_VERSION``."""
         sql = "SELECT SERVICE_LEVEL FROM SYSIBMADM.ENV_INST_INFO"  # noqa: S608
         with self._get_cursor() as cursor:
             cursor.execute(sql)
@@ -763,7 +718,7 @@ class Db2VectorStore(VectorStoreBase):
             return
 
         actual: Tuple[int, int, int] = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        self._db2_version = actual  # store for ANN gating
+        self._db2_version = actual
 
         if actual < _MIN_DB2_VERSION:
             req = ".".join(str(x) for x in _MIN_DB2_VERSION)
@@ -776,24 +731,10 @@ class Db2VectorStore(VectorStoreBase):
         logger.debug("Db2 version check passed: %s", raw.strip())
 
     def _maybe_create_vector_index(self, table_name: str) -> None:
-        """Create a native ANN vector index when ``use_vector_index=True``.
-
-        Guards:
-
-        1. Config flag ``use_vector_index`` must be ``True``.
-        2. Db2 server must be 12.1.5+ (stored in ``self._db2_version``).
-           If version is unknown (``None``) or below threshold, logs a warning
-           and skips — store continues with exact scan.
-        3. ``distance_strategy`` must be in ``_ANN_SUPPORTED_METRICS``
-           (COSINE / EUCLIDEAN / EUCLIDEAN_DISTANCE).  HAMMING / MANHATTAN /
-           DOT are rejected at config-validation time so this is a safety net.
-        4. If ``CREATE VECTOR INDEX`` fails (e.g. insufficient permissions or
-           index already exists), logs a warning and continues — never raises.
-        """
+        """Create a native ANN vector index when ``use_vector_index=True``."""
         if not self.config.use_vector_index:
             return
 
-        # Version gate --------------------------------------------------------
         if self._db2_version is None or self._db2_version < _MIN_ANN_VERSION:
             req = ".".join(str(x) for x in _MIN_ANN_VERSION)
             actual_str = (
@@ -807,13 +748,11 @@ class Db2VectorStore(VectorStoreBase):
             )
             return
 
-        # Metric gate (belt-and-suspenders; config validator already enforces this) -
         if self._distance_strategy not in _ANN_SUPPORTED_METRICS:
             return
 
         bare_name = table_name.strip('"')
         idx_name = f"{bare_name}_vec_idx"
-        # Map EUCLIDEAN_DISTANCE → EUCLIDEAN for the DDL token too.
         sql_metric = _SQL_METRIC.get(self._distance_strategy, self._distance_strategy)
         ddl = (
             f"CREATE VECTOR INDEX {idx_name} "
@@ -828,16 +767,6 @@ class Db2VectorStore(VectorStoreBase):
                 idx_name, table_name, sql_metric,
             )
         except Exception as exc:
-            # Surface the raw Db2 error so the caller sees the real cause.
-            # The most common failure on Db2 Community Edition containers is a
-            # TCP connection drop (SQL30081N) triggered by memory exhaustion
-            # while building the HNSW graph.  This is a CE resource constraint,
-            # not a driver bug.  Suggestions:
-            #   • Increase container memory (--memory=4g or higher).
-            #   • After the error, manually restart the Db2 instance/container
-            #     and reconnect — the index is already on disk and does not need
-            #     to be recreated.
-            #   • Set use_vector_index=False to use exact scan instead.
             logger.warning(
                 "Could not create vector index on %s: %s. "
                 "If running on Db2 Community Edition, this is likely a memory "
@@ -850,46 +779,24 @@ class Db2VectorStore(VectorStoreBase):
 
     @staticmethod
     def _escape_literal(value: str) -> str:
-        """Escape a string for safe inline use in a SQL string literal.
-
-        ibm_db cannot bind ``?`` parameters in queries containing
-        ``SYSTOOLS.BSON2JSON`` or ``VECTOR_DISTANCE``.  Both drivers handle
-        this identically: inline the value as an escaped SQL literal.  Only
-        the single-quote character needs escaping per the SQL standard.
-        """
+        """Escape a string for safe inline use in a SQL string literal."""
         return str(value).replace("'", "''")
 
     def _where_clause(self, filters: Optional[Dict[str, Any]]) -> str:
-        """Build a WHERE clause from a filter dict.
-
-        Supports flat equality filters, operator dicts (eq/ne/gt/gte/lt/lte/
-        in/nin/contains/icontains), wildcard ``"*"``, list shorthand (→ IN),
-        and compound logical keys ``$and`` / ``$or`` / ``$not``
-        (and their unadorned equivalents ``AND`` / ``OR`` / ``NOT``).
-
-        Args:
-            filters: Filter dict as passed by the mem0 Memory layer.
-
-        Returns:
-            SQL fragment starting with ``WHERE``, or ``""`` when no filters.
-        """
+        """Build a WHERE clause from a filter dict."""
         if not filters:
             return ""
         conditions = self._build_conditions(filters)
         return ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
     def _build_conditions(self, filters: Dict[str, Any]) -> List[str]:
-        """Recursively translate a filter dict into a list of SQL condition strings."""
+        """Recursively translate a filter dict into SQL condition strings."""
         conditions: List[str] = []
 
         for key, value in filters.items():
-
-            # -- Logical operators --------------------------------------------
             logical_op = _LOGICAL_OPS.get(key)
             if logical_op is not None:
                 if logical_op == "NOT":
-                    # $not expects a list of sub-filter dicts; combine with OR
-                    # then negate: NOT (A OR B OR …)
                     if not isinstance(value, list):
                         value = [value]
                     sub_parts: List[str] = []
@@ -900,7 +807,6 @@ class Db2VectorStore(VectorStoreBase):
                     if sub_parts:
                         conditions.append("NOT (" + " OR ".join(sub_parts) + ")")
                 else:
-                    # $and / $or expect a list of sub-filter dicts
                     if not isinstance(value, list):
                         value = [value]
                     sub_parts = []
@@ -913,12 +819,10 @@ class Db2VectorStore(VectorStoreBase):
                         conditions.append("(" + joiner.join(sub_parts) + ")")
                 continue
 
-            # -- Field-level filters ------------------------------------------
             mf = self._metadata_field
             json_expr = f"JSON_VALUE(SYSTOOLS.BSON2JSON({mf}), '$.{key}')"
 
             if value == "*":
-                # Wildcard — match any value; skip condition.
                 continue
 
             if isinstance(value, dict):
@@ -938,11 +842,7 @@ class Db2VectorStore(VectorStoreBase):
 
     @staticmethod
     def _op_condition(json_expr: str, op: str, value: Any) -> str:
-        """Translate a single operator dict entry into a SQL condition fragment.
-
-        Supported operators: eq, ne, gt, gte, lt, lte, in, nin,
-        contains, icontains.
-        """
+        """Translate a single operator dict entry into a SQL condition fragment."""
         op = op.lower()
         esc = Db2VectorStore._escape_literal
 
@@ -973,10 +873,8 @@ class Db2VectorStore(VectorStoreBase):
             escaped = ", ".join(f"'{esc(v)}'" for v in value)
             return f"{json_expr} NOT IN ({escaped})"
         if op == "contains":
-            # Substring match — JSON_VALUE returns VARCHAR so LIKE works directly.
             return f"{json_expr} LIKE '%{esc(value)}%'"
         if op == "icontains":
-            # Case-insensitive substring match via LOWER on both sides.
             return f"LOWER({json_expr}) LIKE LOWER('%{esc(value)}%')"
         raise ValueError(
             f"Unsupported filter operator '{op}'. "
