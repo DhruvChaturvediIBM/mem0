@@ -54,6 +54,8 @@ vector-stores = [
     "langchain-aws>=0.2.23,<0.3.0",
     "oracledb>=2.2.0",
     "ibm_db>=3.2.6,<4.0.0",
+    "numpy>=1.26.0; python_version < '3.13'",
+    "numpy>=2.1.0; python_version >= '3.13'",
 ]
 llms = [
     "groq>=0.3.0",

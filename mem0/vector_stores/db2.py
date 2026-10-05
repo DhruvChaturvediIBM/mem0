@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import re
 import math
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from pydantic import BaseModel
@@ -19,6 +21,13 @@ except ImportError as exc:  # pragma: no cover - optional dependency guard
         "The 'ibm_db_dbi' library is required for the Db2 vector store. "
         "Install it with: pip install ibm_db"
     ) from exc
+
+try:
+    import numpy as np
+
+    _HAS_NUMPY = True
+except ImportError:  # pragma: no cover - optional dependency
+    _HAS_NUMPY = False
 
 from mem0.configs.vector_stores.db2 import Db2Config
 from mem0.vector_stores.base import VectorStoreBase
@@ -120,12 +129,74 @@ _LOGICAL_OPS = {
     "NOT":  "NOT",
 }
 
+# Duplicate-key SQLSTATE / SQLCODE indicators (Gap 6 — DuplicatePolicy detection).
+_DUPLICATE_INDICATORS = (
+    "sql0803n",
+    "sqlstate=23505",
+    "sqlcode=-803",
+    "duplicate",
+    "unique",
+    "primary key",
+)
+
 
 def _distance_to_score(distance: float, strategy: str) -> float:
     fn = _SCORE_FROM_DISTANCE.get(strategy)
     if fn is None:
         raise ValueError(f"Unsupported distance strategy: '{strategy}'")
     return fn(distance)
+
+
+# ---------------------------------------------------------------------------
+# Gap 15 — exception decorator
+# Wraps public methods so RuntimeError / ValueError surface cleanly.
+# ---------------------------------------------------------------------------
+
+def _handle_db_exceptions(func):
+    """Decorator that re-raises DB and validation errors with context."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except (RuntimeError, ValueError, TypeError):
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Db2VectorStore.{func.__name__} failed: {exc}"
+            ) from exc
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# Gap 11 — boolean normalisation helper (from Haystack/Geetika)
+# ---------------------------------------------------------------------------
+
+def _normalize_filter_value(value: Any) -> str:
+    """Normalise a Python value for inlining in a SQL string literal.
+
+    Booleans in JSON are stored as ``true``/``false`` text — Python ``True``
+    would otherwise be stringified as ``"True"`` (capital T) which never
+    matches.  Also escapes single quotes per the SQL standard.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value).replace("'", "''")
+
+
+# ---------------------------------------------------------------------------
+# Gap 13 — ISO date detection helper (from Haystack/Geetika)
+# ---------------------------------------------------------------------------
+
+def _is_iso_date(value: Any) -> bool:
+    """Return True if *value* is a string Python recognises as ISO-8601 datetime."""
+    if not isinstance(value, str):
+        return False
+    try:
+        normalized = value.replace("Z", "+00:00") if value.endswith("Z") else value
+        datetime.fromisoformat(normalized)
+        return True
+    except ValueError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +213,69 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _mmr_select_numpy(
+    query_vec: List[float],
+    candidate_vecs: List[List[float]],
+    candidate_items: List[Any],
+    k: int,
+    lambda_mult: float,
+) -> List[Any]:
+    """Numpy-accelerated MMR selection (30–168× faster than pure Python at DIM=1536).
+
+    Uses vectorised matrix operations for cosine similarity — identical algorithm
+    and results to :func:`_mmr_select`.  Called automatically when numpy is available
+    (``_HAS_NUMPY=True``); falls back to the pure-Python path otherwise.
+    """
+    if not candidate_items:
+        return []
+
+    # Build matrix (N, D) and normalise rows so dot-product == cosine similarity.
+    mat = np.array(candidate_vecs, dtype=np.float32)  # (N, D)
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    # Avoid divide-by-zero for zero vectors.
+    norms = np.where(norms == 0.0, 1.0, norms)
+    mat_normed = mat / norms  # (N, D), L2-normalised rows
+
+    q = np.array(query_vec, dtype=np.float32)
+    q_norm = np.linalg.norm(q)
+    q_normed = q / q_norm if q_norm > 0.0 else q  # (D,)
+
+    # Query similarities for all candidates — shape (N,).
+    query_sims = mat_normed @ q_normed
+
+    n = len(candidate_items)
+    k = min(k, n)
+    remaining = list(range(n))
+    selected_indices: List[int] = []
+    # Tracks max redundancy seen so far for each candidate — shape (N,).
+    best_redundancy = np.full(n, -np.inf, dtype=np.float32)
+
+    for _ in range(k):
+        if not remaining:
+            break
+
+        rem = np.array(remaining, dtype=np.intp)
+
+        if selected_indices:
+            # Cosine sim between all remaining candidates and the last selected.
+            last = selected_indices[-1]
+            new_sims = mat_normed[rem] @ mat_normed[last]  # shape (len(rem),)
+            # Update running maximum redundancy for remaining candidates.
+            best_redundancy[rem] = np.maximum(best_redundancy[rem], new_sims)
+            redundancy = best_redundancy[rem]
+        else:
+            redundancy = np.zeros(len(rem), dtype=np.float32)
+
+        scores = lambda_mult * query_sims[rem] - (1.0 - lambda_mult) * redundancy
+        best_local = int(np.argmax(scores))
+        best_idx = remaining[best_local]
+
+        selected_indices.append(best_idx)
+        remaining.pop(best_local)
+
+    return [candidate_items[i] for i in selected_indices]
+
+
 def _mmr_select(
     query_vec: List[float],
     candidate_vecs: List[List[float]],
@@ -154,6 +288,9 @@ def _mmr_select(
     Iteratively picks the candidate that maximises::
 
         score = lambda_mult * sim(item, query) - (1 - lambda_mult) * max_sim(item, selected)
+
+    Dispatches to :func:`_mmr_select_numpy` when numpy is available for a
+    30–168× speedup at DIM=1536, otherwise uses the pure-Python loop below.
 
     Args:
         query_vec: The query embedding vector.
@@ -168,6 +305,9 @@ def _mmr_select(
     """
     if not candidate_items:
         return []
+
+    if _HAS_NUMPY:
+        return _mmr_select_numpy(query_vec, candidate_vecs, candidate_items, k, lambda_mult)
 
     k = min(k, len(candidate_items))
     remaining = list(range(len(candidate_items)))  # indices of unselected candidates
@@ -272,6 +412,35 @@ def _create_table_if_not_exists(
 
 
 # ---------------------------------------------------------------------------
+# Gap 6 — embedding validation helper (from Haystack/Geetika)
+# ---------------------------------------------------------------------------
+
+def _validate_embedding(embedding: Any, allow_none: bool = True) -> None:
+    """Validate an embedding vector's type and contents.
+
+    Args:
+        embedding: Value to validate.
+        allow_none: When ``True`` (default) ``None`` is accepted silently.
+
+    Raises:
+        ValueError: If the embedding is ``None`` when ``allow_none=False``,
+            or is an empty list.
+        TypeError: If the embedding is not a ``list``, or contains non-numeric
+            values.
+    """
+    if embedding is None:
+        if not allow_none:
+            raise ValueError("Embedding cannot be None.")
+        return
+    if not isinstance(embedding, list):
+        raise TypeError(f"Embedding must be a list, got {type(embedding).__name__}.")
+    if len(embedding) == 0:
+        raise ValueError("Embedding cannot be empty.")
+    if not all(isinstance(x, (int, float)) for x in embedding):
+        raise TypeError("All embedding values must be numeric (int or float).")
+
+
+# ---------------------------------------------------------------------------
 # Main class
 # ---------------------------------------------------------------------------
 
@@ -290,9 +459,14 @@ class Db2VectorStore(VectorStoreBase):
             ``connection_params``).
         connection_params: Dict with keys ``database``, ``host``, ``port``,
             ``username``, ``password`` and optionally ``security`` / ``ssl_cert``.
+            When supplied without ``client``, a fresh connection is created
+            via ``ibm_db_dbi.connect()`` giving this instance an isolated handle.
         distance_strategy: Distance function — ``"EUCLIDEAN"`` (default),
             ``"COSINE"``, ``"DOT"``, ``"EUCLIDEAN_DISTANCE"``,
             ``"HAMMING"``, or ``"MANHATTAN"``.
+        db_schema: Optional Db2 schema name.  When set, ``SET SCHEMA <name>`` is
+            issued immediately after connecting so all unqualified table
+            references resolve to that schema.
         use_vector_index: When ``True`` and the Db2 server is 12.1.5+, create
             a native ANN vector index for approximate nearest-neighbour search.
             Only compatible with ``COSINE``, ``EUCLIDEAN``, and
@@ -317,32 +491,17 @@ class Db2VectorStore(VectorStoreBase):
     def __init__(self, **kwargs: Any) -> None:
         self.config = Db2Config(**kwargs)
 
-        # Establish connection ------------------------------------------------
+        # Establish connection — pre-built client takes priority (test / advanced
+        # usage).  Otherwise build a fresh connection via connect() so each
+        # Db2VectorStore instance owns an isolated handle.  pconnect() pools by
+        # DSN — DDL issued through one instance leaves the shared handle in an
+        # intermediate CLI state causing CLI0125E on the next fetchall() in a
+        # different instance.  connect() avoids this entirely, matching LangChain's
+        # langchain-db2 approach.
         if self.config.client is not None:
             self.client = self.config.client
         else:
-            cp = self.config.connection_params or {}
-            conn_str = (
-                f"DATABASE={cp.get('database')};"
-                f"HOSTNAME={cp.get('host')};"
-                f"PORT={cp.get('port', 50000)};"
-                f"PROTOCOL=TCPIP;"
-                f"UID={cp.get('username')};"
-                f"PWD={cp.get('password')};"
-                f"Authentication=SERVER;"
-            )
-            if "security" in cp:
-                conn_str += f"SECURITY={cp['security']};"
-                ssl_cert = cp.get("ssl_cert", "")
-                if ssl_cert:
-                    conn_str += f"SSLServerCertificate={ssl_cert};"
-            try:
-                self.client = ibm_db_dbi.connect(conn_str, "", "")
-            except Exception as exc:
-                safe = re.sub(r"PWD=[^;]*", "PWD=***", conn_str)
-                raise ConnectionError(
-                    f"Db2 connection failed: {exc}  (conn={safe})"
-                ) from exc
+            self.client = self._build_connection()
 
         # Version check — fail fast if Db2 is too old for AI Vector Search.
         # Also stores self._db2_version for use_vector_index gating below.
@@ -361,7 +520,17 @@ class Db2VectorStore(VectorStoreBase):
         # Probe once at startup whether Db2 Text Search is installed.
         self._text_search_available: bool = self._probe_text_search()
 
-        # Ensure table exists --------------------------------------------------
+        # Probe once whether the driver supports ? bindings inside
+        # JSON_VALUE(SYSTOOLS.BSON2JSON(...) RETURNING VARCHAR(1000)) predicates.
+        # On Db2 12.1.3 + ibm_db 3.3.0 this crashes with SIGSEGV when the
+        # RETURNING clause is omitted.  Adding RETURNING VARCHAR(1000) fixes it
+        # on 12.1.5+.  If the probe passes we use parameterized ? bindings
+        # (Gap 15 — safer, matches Haystack).  If it fails for any reason
+        # we fall back to the current inline-escaped path automatically.
+        self._use_param_bindings: bool = self._probe_param_bindings()
+
+        # Ensure table exists — called in __init__ (not lazily) so failures
+        # surface immediately at construction time.
         _create_table_if_not_exists(
             self.client,
             self.collection_name,
@@ -377,7 +546,62 @@ class Db2VectorStore(VectorStoreBase):
         self._maybe_create_vector_index(self.collection_name)
 
     # ------------------------------------------------------------------
-    # Change 6: unified cursor context manager
+    # Gap 2 — connection builder (Gap 1+3 originally used pconnect; switched
+    # to connect() so each instance owns an isolated handle — see __init__)
+    # ------------------------------------------------------------------
+
+    def _build_connection(self) -> Any:
+        """Build a fresh Db2 connection via ``ibm_db_dbi.connect()``.
+
+        Each ``Db2VectorStore`` instance gets its own isolated connection handle.
+        Using ``connect()`` (not ``pconnect()``) prevents DDL statements such as
+        ``DROP TABLE`` or ``TRUNCATE TABLE`` — which auto-commit in Db2 — from
+        leaving a shared pooled handle in an intermediate CLI state that causes
+        ``CLI0125E Function sequence error`` on subsequent ``fetchall()`` calls
+        through a different instance.  This matches LangChain's ``langchain-db2``
+        approach.
+        """
+        cp = self.config.connection_params or {}
+        conn_str = (
+            f"DATABASE={cp.get('database')};"
+            f"HOSTNAME={cp.get('host')};"
+            f"PORT={cp.get('port', 50000)};"
+            f"PROTOCOL=TCPIP;"
+            f"UID={cp.get('username')};"
+            f"PWD={cp.get('password')};"
+            f"Authentication=SERVER;"
+        )
+        if "security" in cp:
+            conn_str += f"SECURITY={cp['security']};"
+            ssl_cert = cp.get("ssl_cert", "")
+            if ssl_cert:
+                conn_str += f"SSLServerCertificate={ssl_cert};"
+        try:
+            conn = ibm_db_dbi.connect(conn_str, "", "")
+        except Exception as exc:
+            safe = re.sub(r"PWD=[^;]*", "PWD=***", conn_str)
+            raise ConnectionError(
+                f"Db2 connection failed: {exc}  (conn={safe})"
+            ) from exc
+
+        # Gap 9 — SET SCHEMA if configured.
+        if self.config.db_schema:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(f"SET SCHEMA {self.config.db_schema}")
+                conn.commit()
+            except Exception as exc:
+                conn.rollback()
+                raise RuntimeError(
+                    f"Failed to set schema '{self.config.db_schema}': {exc}"
+                ) from exc
+            finally:
+                cursor.close()
+
+        return conn
+
+    # ------------------------------------------------------------------
+    # Unified cursor context manager
     # Replaces 12 identical try/finally cursor.close() blocks.
     # Guarantees cursor.close() even when rollback itself raises.
     # ------------------------------------------------------------------
@@ -423,11 +647,13 @@ class Db2VectorStore(VectorStoreBase):
         )
         self._maybe_create_vector_index(name)
 
+    @_handle_db_exceptions
     def insert(
         self,
         vectors: List[list],
         payloads: Optional[List[Dict]] = None,
         ids: Optional[List[str]] = None,
+        upsert: bool = False,
     ) -> List[str]:
         """Insert vectors (with optional payloads / ids) into the table.
 
@@ -435,6 +661,10 @@ class Db2VectorStore(VectorStoreBase):
             vectors: Embedding vectors to store.
             payloads: Optional list of metadata dicts (one per vector).
             ids: Optional list of string IDs. If omitted, UUIDs are generated.
+            upsert: When ``True``, use ``MERGE INTO`` so existing rows are
+                updated instead of raising a duplicate-key error (Gap 2/4/5).
+                When ``False`` (default), a plain ``INSERT`` is used; a
+                duplicate primary key raises ``ValueError``.
 
         Returns:
             List of stored IDs.
@@ -444,6 +674,13 @@ class Db2VectorStore(VectorStoreBase):
             payloads = [{} for _ in range(n)]
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in range(n)]
+
+        # Gap 6 — validate all incoming embeddings before touching the DB.
+        for i, vec in enumerate(vectors):
+            try:
+                _validate_embedding(vec, allow_none=False)
+            except (ValueError, TypeError) as exc:
+                raise type(exc)(f"Invalid embedding at index {i}: {exc}") from exc
 
         embedding_len = len(vectors[0]) if vectors else self._embedding_dim
 
@@ -458,19 +695,123 @@ class Db2VectorStore(VectorStoreBase):
             for vid, vec, meta in zip(ids, vectors, payloads)
         ]
 
-        sql = (
-            f"INSERT INTO {self.collection_name} "  # noqa: S608
-            f"({self._id_field}, {self._embedding_field}, "
-            f"{self._metadata_field}, {self._text_field}, "
-            f"{self._text_lemmatized_field}) "
-            f"VALUES (?, VECTOR(?, {embedding_len}, FLOAT32), SYSTOOLS.JSON2BSON(?), ?, ?)"
-        )
-
-        with self._get_cursor(commit=True) as cursor:
-            cursor.executemany(sql, rows)
+        if upsert:
+            # Gap 4 — OVERWRITE: update existing, insert new (MERGE INTO).
+            sql = (
+                f"MERGE INTO {self.collection_name} AS t "  # noqa: S608
+                f"USING (VALUES (?, VECTOR(?, {embedding_len}, FLOAT32), "
+                f"SYSTOOLS.JSON2BSON(?), ?, ?)) "
+                f"AS s({self._id_field}, {self._embedding_field}, "
+                f"{self._metadata_field}, {self._text_field}, "
+                f"{self._text_lemmatized_field}) "
+                f"ON t.{self._id_field} = s.{self._id_field} "
+                f"WHEN MATCHED THEN UPDATE SET "
+                f"t.{self._embedding_field} = s.{self._embedding_field}, "
+                f"t.{self._metadata_field} = s.{self._metadata_field}, "
+                f"t.{self._text_field} = s.{self._text_field}, "
+                f"t.{self._text_lemmatized_field} = s.{self._text_lemmatized_field} "
+                f"WHEN NOT MATCHED THEN INSERT "
+                f"({self._id_field}, {self._embedding_field}, "
+                f"{self._metadata_field}, {self._text_field}, "
+                f"{self._text_lemmatized_field}) "
+                f"VALUES (s.{self._id_field}, s.{self._embedding_field}, "
+                f"s.{self._metadata_field}, s.{self._text_field}, "
+                f"s.{self._text_lemmatized_field})"
+            )
+            with self._get_cursor(commit=True) as cursor:
+                for row in rows:
+                    cursor.execute(sql, row)
+        else:
+            # Plain INSERT — Gap 6: detect duplicate key and raise ValueError.
+            sql = (
+                f"INSERT INTO {self.collection_name} "  # noqa: S608
+                f"({self._id_field}, {self._embedding_field}, "
+                f"{self._metadata_field}, {self._text_field}, "
+                f"{self._text_lemmatized_field}) "
+                f"VALUES (?, VECTOR(?, {embedding_len}, FLOAT32), SYSTOOLS.JSON2BSON(?), ?, ?)"
+            )
+            try:
+                with self._get_cursor(commit=True) as cursor:
+                    cursor.executemany(sql, rows)
+            except Exception as exc:
+                err = str(exc).lower()
+                if any(ind in err for ind in _DUPLICATE_INDICATORS):
+                    raise ValueError(
+                        f"Duplicate ID detected. Use upsert=True to overwrite "
+                        f"existing records. Original error: {exc}"
+                    ) from exc
+                raise
 
         return ids
 
+    @_handle_db_exceptions
+    def insert_skip_duplicates(
+        self,
+        vectors: List[list],
+        payloads: Optional[List[Dict]] = None,
+        ids: Optional[List[str]] = None,
+    ) -> List[str]:
+        """Insert vectors, silently skipping any IDs that already exist (Gap 5).
+
+        Uses ``MERGE INTO … WHEN NOT MATCHED THEN INSERT`` — existing rows are
+        left unchanged.
+
+        Args:
+            vectors: Embedding vectors to store.
+            payloads: Optional list of metadata dicts (one per vector).
+            ids: Optional list of string IDs. If omitted, UUIDs are generated.
+
+        Returns:
+            List of IDs that were actually inserted (subset of ``ids``).
+        """
+        n = len(vectors)
+        if payloads is None:
+            payloads = [{} for _ in range(n)]
+        if ids is None:
+            ids = [str(uuid.uuid4()) for _ in range(n)]
+
+        for i, vec in enumerate(vectors):
+            try:
+                _validate_embedding(vec, allow_none=False)
+            except (ValueError, TypeError) as exc:
+                raise type(exc)(f"Invalid embedding at index {i}: {exc}") from exc
+
+        embedding_len = len(vectors[0]) if vectors else self._embedding_dim
+
+        sql = (
+            f"MERGE INTO {self.collection_name} AS t "  # noqa: S608
+            f"USING (VALUES (?, VECTOR(?, {embedding_len}, FLOAT32), "
+            f"SYSTOOLS.JSON2BSON(?), ?, ?)) "
+            f"AS s({self._id_field}, {self._embedding_field}, "
+            f"{self._metadata_field}, {self._text_field}, "
+            f"{self._text_lemmatized_field}) "
+            f"ON t.{self._id_field} = s.{self._id_field} "
+            f"WHEN NOT MATCHED THEN INSERT "
+            f"({self._id_field}, {self._embedding_field}, "
+            f"{self._metadata_field}, {self._text_field}, "
+            f"{self._text_lemmatized_field}) "
+            f"VALUES (s.{self._id_field}, s.{self._embedding_field}, "
+            f"s.{self._metadata_field}, s.{self._text_field}, "
+            f"s.{self._text_lemmatized_field})"
+        )
+
+        inserted: List[str] = []
+        with self._get_cursor(commit=True) as cursor:
+            for vid, vec, meta in zip(ids, vectors, payloads):
+                row = (
+                    vid,
+                    "[" + ", ".join(str(v) for v in vec) + "]",
+                    json.dumps(meta),
+                    meta.get("data", ""),
+                    meta.get("text_lemmatized", ""),
+                )
+                cursor.execute(sql, row)
+                if cursor.rowcount > 0:
+                    inserted.append(vid)
+
+        return inserted
+
+    @_handle_db_exceptions
     def search(
         self,
         query: str,
@@ -478,7 +819,12 @@ class Db2VectorStore(VectorStoreBase):
         top_k: int = 5,
         filters: Optional[Dict] = None,
     ) -> List[OutputData]:
-        """Search for the *top_k* nearest vectors."""
+        """Search for the *top_k* nearest vectors.
+
+        Guards:
+        - Skips rows with NULL embeddings (Gap 11).
+        - Catches SQL0801N division-by-zero from COSINE on zero vectors (Gap 12).
+        """
         if vectors and isinstance(vectors[0], (int, float)):
             embedding = vectors
         else:
@@ -486,12 +832,16 @@ class Db2VectorStore(VectorStoreBase):
         embedding_len = len(embedding) if embedding else self._embedding_dim
 
         embedding_str = "[" + ", ".join(str(v) for v in embedding) + "]"
-        where_clause = self._where_clause(filters)
+        where_clause, filter_params = self._where_clause(filters)
         order_dir = _ORDER_BY_DIRECTION[self._distance_strategy]
-        # EUCLIDEAN_DISTANCE is not a valid SQL token in VECTOR_DISTANCE() —
-        # only "EUCLIDEAN" is accepted (SQL0104N on 12.1.3 and 12.1.5).
-        # Map it here; the alias remains valid at config/Python level.
         sql_metric = _SQL_METRIC.get(self._distance_strategy, self._distance_strategy)
+
+        # Gap 11 — NULL-embedding guard: exclude rows whose embedding is NULL.
+        null_check = f"{self._embedding_field} IS NOT NULL"
+        if where_clause:
+            full_where = f"{where_clause} AND {null_check}"
+        else:
+            full_where = f"WHERE {null_check}"
 
         sql = (
             f"SELECT {self._id_field}, "  # noqa: S608
@@ -501,14 +851,22 @@ class Db2VectorStore(VectorStoreBase):
             f"VECTOR('{embedding_str}', {embedding_len}, FLOAT32), "
             f"{sql_metric}) AS distance "
             f"FROM {self.collection_name} "
-            f"{where_clause} "
+            f"{full_where} "
             f"ORDER BY distance {order_dir} "
             f"FETCH FIRST {top_k} ROWS ONLY"
         )
 
-        with self._get_cursor() as cursor:
-            cursor.execute(sql)
-            rows = cursor.fetchall()
+        try:
+            with self._get_cursor() as cursor:
+                cursor.execute(sql, filter_params) if filter_params else cursor.execute(sql)
+                rows = cursor.fetchall()
+        except Exception as exc:
+            # Gap 12 — SQL0801N: COSINE on a zero-vector causes division by zero.
+            err = str(exc)
+            if "SQL0801N" in err or "Division by zero" in err:
+                logger.debug("search() returned empty — SQL0801N (zero-vector): %s", exc)
+                return []
+            raise
 
         results = []
         for row in rows:
@@ -517,7 +875,7 @@ class Db2VectorStore(VectorStoreBase):
             results.append(OutputData(id=row[0], score=score, payload=metadata))
         return results
 
-
+    @_handle_db_exceptions
     def mmr_search(
         self,
         query: str,
@@ -569,9 +927,16 @@ class Db2VectorStore(VectorStoreBase):
         embedding_len = len(embedding) if embedding else self._embedding_dim
         embedding_str = "[" + ", ".join(str(v) for v in embedding) + "]"
 
-        where_clause = self._where_clause(filters)
+        where_clause, filter_params = self._where_clause(filters)
         order_dir = _ORDER_BY_DIRECTION[self._distance_strategy]
         sql_metric = _SQL_METRIC.get(self._distance_strategy, self._distance_strategy)
+
+        # Gap 11 — NULL-embedding guard.
+        null_check = f"{self._embedding_field} IS NOT NULL"
+        if where_clause:
+            full_where = f"{where_clause} AND {null_check}"
+        else:
+            full_where = f"WHERE {null_check}"
 
         sql = (
             f"SELECT {self._id_field}, "  # noqa: S608
@@ -582,14 +947,22 @@ class Db2VectorStore(VectorStoreBase):
             f"{sql_metric}) AS distance, "
             f"VECTOR_SERIALIZE({self._embedding_field}) AS emb_str "
             f"FROM {self.collection_name} "
-            f"{where_clause} "
+            f"{full_where} "
             f"ORDER BY distance {order_dir} "
             f"FETCH FIRST {fetch_k} ROWS ONLY"
         )
 
-        with self._get_cursor() as cursor:
-            cursor.execute(sql)
-            rows = cursor.fetchall()
+        try:
+            with self._get_cursor() as cursor:
+                cursor.execute(sql, filter_params) if filter_params else cursor.execute(sql)
+                rows = cursor.fetchall()
+        except Exception as exc:
+            # Gap 12 — SQL0801N guard.
+            err = str(exc)
+            if "SQL0801N" in err or "Division by zero" in err:
+                logger.debug("mmr_search() returned empty — SQL0801N (zero-vector): %s", exc)
+                return []
+            raise
 
         if not rows:
             return []
@@ -605,7 +978,6 @@ class Db2VectorStore(VectorStoreBase):
             candidate_items.append(item)
 
             # VECTOR_SERIALIZE returns a string like "[0.1, 0.2, ...]".
-            # Parse it back into a float list for MMR cosine computations.
             raw_emb = row[4]
             if raw_emb:
                 emb_vec = [float(x) for x in raw_emb.strip("[]").split(",") if x.strip()]
@@ -622,12 +994,80 @@ class Db2VectorStore(VectorStoreBase):
             lambda_mult=lambda_mult,
         )
 
+    @_handle_db_exceptions
+    def mmr_search_with_scores(
+        self,
+        query: str,
+        vectors: List[list],
+        top_k: int = 5,
+        fetch_k: int = 20,
+        lambda_mult: float = 0.5,
+        filters: Optional[Dict] = None,
+    ) -> List[Tuple[OutputData, float]]:
+        """MMR search returning ``(OutputData, score)`` pairs (Gap 10).
+
+        Identical to :meth:`mmr_search` but returns a list of
+        ``(item, score)`` tuples — mirroring LangChain's
+        ``max_marginal_relevance_search_with_score_by_vector()``.
+
+        Args:
+            query: Original query string (not used for SQL).
+            vectors: Query embedding.
+            top_k: Number of diverse results to return.
+            fetch_k: Candidate pool size before MMR re-ranking.
+            lambda_mult: Diversity control in ``[0.0, 1.0]``.
+            filters: Optional metadata filters.
+
+        Returns:
+            List of ``(OutputData, score)`` tuples selected by MMR.
+        """
+        items = self.mmr_search(
+            query=query,
+            vectors=vectors,
+            top_k=top_k,
+            fetch_k=fetch_k,
+            lambda_mult=lambda_mult,
+            filters=filters,
+        )
+        return [(item, item.score) for item in items]
+
+    @_handle_db_exceptions
     def delete(self, vector_id: str) -> None:
         """Delete a single vector by ID."""
         sql = f"DELETE FROM {self.collection_name} WHERE {self._id_field} = ?"  # noqa: S608
         with self._get_cursor(commit=True) as cursor:
             cursor.execute(sql, [vector_id])
 
+    @_handle_db_exceptions
+    def delete_by_filter(self, filters: Dict[str, Any]) -> int:
+        """Delete all rows matching *filters* (Gap 19).
+
+        Args:
+            filters: Metadata filter dict — same format as :meth:`search`.
+                     Must be non-empty; passing ``{}`` or ``None`` raises
+                     ``ValueError`` to avoid accidental full-table deletes.
+                     Use :meth:`reset` or :meth:`clear` to wipe all rows.
+
+        Returns:
+            Number of rows deleted.
+        """
+        if not filters:
+            raise ValueError(
+                "filters must be non-empty for delete_by_filter(). "
+                "Use reset() or clear() to delete all rows."
+            )
+        where_clause, filter_params = self._where_clause(filters)
+        if not where_clause:
+            raise ValueError(
+                "The supplied filters produced an empty WHERE clause. "
+                "Use reset() or clear() to delete all rows."
+            )
+        sql = f"DELETE FROM {self.collection_name} {where_clause}"  # noqa: S608
+        with self._get_cursor(commit=True) as cursor:
+            cursor.execute(sql, filter_params) if filter_params else cursor.execute(sql)
+            return cursor.rowcount if cursor.rowcount is not None else 0
+
+    @_handle_db_exceptions
     def update(
         self,
         vector_id: str,
@@ -637,6 +1077,10 @@ class Db2VectorStore(VectorStoreBase):
         """Update the embedding and/or payload of an existing record."""
         if vector is None and payload is None:
             return
+
+        # Gap 6 — validate the incoming vector if provided.
+        if vector is not None:
+            _validate_embedding(vector, allow_none=False)
 
         set_parts = []
         params: List[Any] = []
@@ -667,6 +1111,7 @@ class Db2VectorStore(VectorStoreBase):
         with self._get_cursor(commit=True) as cursor:
             cursor.execute(sql, params)
 
+    @_handle_db_exceptions
     def get(self, vector_id: str) -> Optional[OutputData]:
         """Retrieve a single record by ID."""
         sql = (
@@ -686,6 +1131,7 @@ class Db2VectorStore(VectorStoreBase):
         metadata = json.loads(row[2] if row[2] is not None else "{}")
         return OutputData(id=row[0], score=None, payload=metadata)
 
+    @_handle_db_exceptions
     def list_cols(self) -> List[str]:
         """Return the names of all user tables in the current schema."""
         sql = "SELECT TABNAME FROM SYSCAT.TABLES WHERE TYPE = 'T' AND TABSCHEMA = CURRENT SCHEMA"  # noqa: S608
@@ -694,15 +1140,33 @@ class Db2VectorStore(VectorStoreBase):
             rows = cursor.fetchall()
         return [row[0] for row in rows]
 
+    @_handle_db_exceptions
     def delete_col(self) -> None:
         """Drop the collection table if it exists."""
         if not _table_exists(self.client, self.collection_name):
             logger.info("Table %s not found; nothing to drop.", self.collection_name)
             return
-        with self._get_cursor(commit=True) as cursor:
-            cursor.execute(f"DROP TABLE {self.collection_name}")
+        # DROP TABLE is DDL — it auto-commits in Db2.  Mirroring LangChain's
+        # drop_table() pattern: commit any open transaction first, execute the
+        # DDL, call client.commit() while the cursor is *still open*, then close
+        # the cursor last.  (Kept even with connect() for safety — the explicit
+        # commit/rollback ensures a clean transaction state on any driver.)
+        self.client.commit()
+        drop_cursor = self.client.cursor()
+        try:
+            drop_cursor.execute(f"DROP TABLE {self.collection_name}")
+            self.client.commit()
+        except Exception:
+            try:
+                self.client.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            drop_cursor.close()
         logger.info("Table %s dropped.", self.collection_name)
 
+    @_handle_db_exceptions
     def col_info(self) -> Dict[str, Any]:
         """Return metadata about the collection table.
 
@@ -716,8 +1180,6 @@ class Db2VectorStore(VectorStoreBase):
             ``embedding_model_dims``, and ``distance_strategy``.
             The last two are in-memory values requiring no extra SQL.
         """
-        # Single round-trip: catalog lookup + live COUNT(*) as a scalar subquery.
-        # UPPER(?) normalises the caller-supplied table name to match SYSCAT casing.
         sql = (  # noqa: S608
             "SELECT TABSCHEMA, TABNAME, "
             f"(SELECT COUNT(*) FROM {self.collection_name}) AS row_count "
@@ -739,13 +1201,14 @@ class Db2VectorStore(VectorStoreBase):
             "distance_strategy": self._distance_strategy,
         }
 
+    @_handle_db_exceptions
     def list(
         self,
         filters: Optional[Dict] = None,
         top_k: Optional[int] = 100,
     ) -> List[List[OutputData]]:
         """List records in the collection."""
-        where_clause = self._where_clause(filters)
+        where_clause, filter_params = self._where_clause(filters)
         limit = f"FETCH FIRST {top_k} ROWS ONLY" if top_k is not None else ""
 
         sql = (
@@ -758,7 +1221,7 @@ class Db2VectorStore(VectorStoreBase):
         )
 
         with self._get_cursor() as cursor:
-            cursor.execute(sql)
+            cursor.execute(sql, filter_params) if filter_params else cursor.execute(sql)
             rows = cursor.fetchall()
 
         results = []
@@ -767,6 +1230,7 @@ class Db2VectorStore(VectorStoreBase):
             results.append(OutputData(id=row[0], score=None, payload=metadata))
         return [results]
 
+    @_handle_db_exceptions
     def reset(self) -> None:
         """Drop and recreate the collection table."""
         logger.warning("Resetting collection %s …", self.collection_name)
@@ -783,6 +1247,46 @@ class Db2VectorStore(VectorStoreBase):
         )
         self._maybe_create_vector_index(self.collection_name)
 
+    @_handle_db_exceptions
+    def clear(self) -> int:
+        """Remove all rows from the collection using ``TRUNCATE TABLE`` (Gap 18).
+
+        Faster than :meth:`reset` for large tables because it does not issue
+        any DDL — the table structure and any vector index are preserved.
+        Equivalent to LangChain's ``clear_table()``.
+
+        Returns:
+            Number of rows that existed before truncation (from a pre-count).
+        """
+        count_sql = f"SELECT COUNT(*) FROM {self.collection_name}"  # noqa: S608
+        with self._get_cursor() as cursor:
+            cursor.execute(count_sql)
+            row = cursor.fetchone()
+            deleted = row[0] if row else 0
+
+        # TRUNCATE TABLE … IMMEDIATE is DDL — it auto-commits in Db2.
+        # Mirroring LangChain's clear_table() pattern: commit before, execute
+        # the DDL, call client.commit() while the cursor is *still open*, then
+        # close the cursor last.  (Kept even with connect() for safety — the
+        # explicit commit/rollback ensures clean transaction state on any driver.)
+        self.client.commit()
+        trunc_cursor = self.client.cursor()
+        try:
+            trunc_cursor.execute(f"TRUNCATE TABLE {self.collection_name} IMMEDIATE")
+            self.client.commit()
+        except Exception:
+            try:
+                self.client.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            trunc_cursor.close()
+
+        logger.info("Table %s truncated (%d rows removed).", self.collection_name, deleted)
+        return deleted
+
+    @_handle_db_exceptions
     def keyword_search(
         self,
         query: str,
@@ -820,17 +1324,9 @@ class Db2VectorStore(VectorStoreBase):
         if not self._text_search_available:
             return None
 
-        # The query string is inlined as an escaped SQL literal rather than
-        # bound with a ``?`` parameter marker.  See ``_escape_literal()`` for
-        # the full explanation.  Short version: ibm_db 3.3.0 segfaults
-        # (SIGSEGV, exit 139) when ``?`` is used as the comparison value
-        # inside a ``JSON_VALUE(SYSTOOLS.BSON2JSON(...)) = ?`` predicate —
-        # verified on Db2 12.1.3.0 RHEL x86_64 with the native ibm_db driver.
-        # Inlining via ``_escape_literal()`` is the only safe approach.
         esc_query = self._escape_literal(query)
-        where_clause = self._where_clause(filters)
+        where_clause, filter_params = self._where_clause(filters)
 
-        # CONTAINS() must be the first predicate in WHERE or follow AND.
         if where_clause:
             text_pred = (
                 f"AND CONTAINS({self._text_lemmatized_field}, '{esc_query}') = 1"
@@ -854,10 +1350,9 @@ class Db2VectorStore(VectorStoreBase):
 
         try:
             with self._get_cursor() as cursor:
-                cursor.execute(sql)
+                cursor.execute(sql, filter_params) if filter_params else cursor.execute(sql)
                 rows = cursor.fetchall()
         except Exception as exc:
-            # Text Search index may have been dropped since startup probe.
             logger.debug(
                 "keyword_search() fell back to None (Text Search unavailable): %s", exc
             )
@@ -890,12 +1385,7 @@ class Db2VectorStore(VectorStoreBase):
     # ------------------------------------------------------------------
 
     def _probe_text_search(self) -> bool:
-        """Return ``True`` if Db2 Text Search is active on this database.
-
-        Runs a real ``CONTAINS()`` call against a trivial VALUES subquery.
-        ``SQL21000N`` is raised when Text Search is not configured; any
-        exception is caught and treated as unavailable so startup never fails.
-        """
+        """Return ``True`` if Db2 Text Search is active on this database."""
         sql = "SELECT CONTAINS(v, 'probe') FROM (VALUES ('probe text')) AS t(v)"  # noqa: S608
         available = False
         try:
@@ -918,14 +1408,50 @@ class Db2VectorStore(VectorStoreBase):
             )
         return available
 
-    def _check_db2_version(self) -> None:
-        """Raise ``RuntimeError`` if the connected Db2 is below ``_MIN_DB2_VERSION``.
+    def _probe_param_bindings(self) -> bool:
+        """Return ``True`` if the driver safely handles ``?`` bindings inside
+        ``JSON_VALUE(SYSTOOLS.BSON2JSON(...) RETURNING VARCHAR(1000))`` predicates.
 
-        Also stores the parsed version tuple on ``self._db2_version`` for use
-        by :meth:`_maybe_create_vector_index` to gate ANN index creation on
-        12.1.5+.  If the version cannot be parsed, ``self._db2_version`` stays
-        ``None`` and downstream code treats it as below the ANN threshold.
+        The segfault (SIGSEGV, exit 139) that originally blocked parameterized
+        bindings was caused by two factors acting together:
+
+        1. Omitting ``RETURNING VARCHAR(1000)`` from ``JSON_VALUE`` — the driver
+           then cannot determine the return type when binding ``?``.
+        2. An ibm_db 3.3.0 bug on Db2 12.1.3 that causes a NULL-pointer
+           dereference in that case.
+
+        Adding ``RETURNING VARCHAR(1000)`` fixes both issues on Db2 12.1.5+.
+        This probe verifies the fix is safe on the connected server/driver by
+        executing a minimal ``VALUES``-based query with a ``?`` parameter.  If
+        the query succeeds, ``_use_param_bindings`` is set to ``True`` and all
+        filter predicates use ``?`` (Gap 15).  If it fails for *any* reason —
+        including a future driver regression — we fall back to inline escaping.
         """
+        # Use a VALUES subquery so no real table is needed.
+        # The expression mirrors exactly what _build_conditions() generates.
+        probe_sql = (
+            "SELECT JSON_VALUE(SYSTOOLS.BSON2JSON(v), '$.x' RETURNING VARCHAR(1000)) "
+            "FROM (VALUES (SYSTOOLS.JSON2BSON('{\"x\":\"ok\"}'))) AS t(v) "
+            "WHERE JSON_VALUE(SYSTOOLS.BSON2JSON(v), '$.x' RETURNING VARCHAR(1000)) = ?"
+        )
+        try:
+            with self._get_cursor() as cursor:
+                cursor.execute(probe_sql, ["ok"])
+                cursor.fetchone()
+            logger.debug(
+                "Parameterized ? bindings supported — filter predicates will use "
+                "RETURNING VARCHAR(1000) + ? (Gap 15)."
+            )
+            return True
+        except Exception as exc:
+            logger.debug(
+                "Parameterized ? bindings probe failed (%s) — falling back to "
+                "inline-escaped literals for filter predicates.", exc
+            )
+            return False
+
+    def _check_db2_version(self) -> None:
+        """Raise ``RuntimeError`` if the connected Db2 is below ``_MIN_DB2_VERSION``."""
         sql = "SELECT SERVICE_LEVEL FROM SYSIBMADM.ENV_INST_INFO"  # noqa: S608
         with self._get_cursor() as cursor:
             cursor.execute(sql)
@@ -942,7 +1468,7 @@ class Db2VectorStore(VectorStoreBase):
             return
 
         actual: Tuple[int, int, int] = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        self._db2_version = actual  # store for ANN gating
+        self._db2_version = actual
 
         if actual < _MIN_DB2_VERSION:
             req = ".".join(str(x) for x in _MIN_DB2_VERSION)
@@ -955,24 +1481,10 @@ class Db2VectorStore(VectorStoreBase):
         logger.debug("Db2 version check passed: %s", raw.strip())
 
     def _maybe_create_vector_index(self, table_name: str) -> None:
-        """Create a native ANN vector index when ``use_vector_index=True``.
-
-        Guards:
-
-        1. Config flag ``use_vector_index`` must be ``True``.
-        2. Db2 server must be 12.1.5+ (stored in ``self._db2_version``).
-           If version is unknown (``None``) or below threshold, logs a warning
-           and skips — store continues with exact scan.
-        3. ``distance_strategy`` must be in ``_ANN_SUPPORTED_METRICS``
-           (COSINE / EUCLIDEAN / EUCLIDEAN_DISTANCE).  HAMMING / MANHATTAN /
-           DOT are rejected at config-validation time so this is a safety net.
-        4. If ``CREATE VECTOR INDEX`` fails (e.g. insufficient permissions or
-           index already exists), logs a warning and continues — never raises.
-        """
+        """Create a native ANN vector index when ``use_vector_index=True``."""
         if not self.config.use_vector_index:
             return
 
-        # Version gate --------------------------------------------------------
         if self._db2_version is None or self._db2_version < _MIN_ANN_VERSION:
             req = ".".join(str(x) for x in _MIN_ANN_VERSION)
             actual_str = (
@@ -986,13 +1498,11 @@ class Db2VectorStore(VectorStoreBase):
             )
             return
 
-        # Metric gate (belt-and-suspenders; config validator already enforces this) -
         if self._distance_strategy not in _ANN_SUPPORTED_METRICS:
             return
 
         bare_name = table_name.strip('"')
         idx_name = f"{bare_name}_vec_idx"
-        # Map EUCLIDEAN_DISTANCE → EUCLIDEAN for the DDL token too.
         sql_metric = _SQL_METRIC.get(self._distance_strategy, self._distance_strategy)
         ddl = (
             f"CREATE VECTOR INDEX {idx_name} "
@@ -1007,16 +1517,6 @@ class Db2VectorStore(VectorStoreBase):
                 idx_name, table_name, sql_metric,
             )
         except Exception as exc:
-            # Surface the raw Db2 error so the caller sees the real cause.
-            # The most common failure on Db2 Community Edition containers is a
-            # TCP connection drop (SQL30081N) triggered by memory exhaustion
-            # while building the HNSW graph.  This is a CE resource constraint,
-            # not a driver bug.  Suggestions:
-            #   • Increase container memory (--memory=4g or higher).
-            #   • After the error, manually restart the Db2 instance/container
-            #     and reconnect — the index is already on disk and does not need
-            #     to be recreated.
-            #   • Set use_vector_index=False to use exact scan instead.
             logger.warning(
                 "Could not create vector index on %s: %s. "
                 "If running on Db2 Community Edition, this is likely a memory "
@@ -1031,34 +1531,54 @@ class Db2VectorStore(VectorStoreBase):
     def _escape_literal(value: str) -> str:
         """Escape a string for safe inline use in a SQL string literal.
 
-        ibm_db cannot bind ``?`` parameters in queries containing
-        ``SYSTOOLS.BSON2JSON`` or ``VECTOR_DISTANCE``.  Both drivers handle
-        this identically: inline the value as an escaped SQL literal.  Only
-        the single-quote character needs escaping per the SQL standard.
+        Only used for CONTAINS()/SCORE() in keyword_search() where ibm_db
+        cannot bind ``?`` parameters inside Text Search predicates.
+        For all other filters, parameterized bindings are used via
+        ``_build_conditions()`` (Gap 15).
         """
         return str(value).replace("'", "''")
 
-    def _where_clause(self, filters: Optional[Dict[str, Any]]) -> str:
+    def _where_clause(self, filters: Optional[Dict[str, Any]]) -> "Tuple[str, List[Any]]":
         """Build a WHERE clause from a filter dict.
+
+        Returns a ``(sql_fragment, params)`` tuple so callers can pass ``params``
+        directly to ``cursor.execute(sql, params)``.
+
+        When ``self._use_param_bindings`` is ``True`` (probed at connect time),
+        field values are bound with ``?`` inside
+        ``JSON_VALUE(SYSTOOLS.BSON2JSON(...) RETURNING VARCHAR(1000))`` — Gap 15.
+        When ``False`` (older driver / probe failed), values are inlined as
+        escaped literals via ``_normalize_filter_value()`` — the original safe
+        fallback.  The fallback activates automatically; no manual intervention.
 
         Supports flat equality filters, operator dicts (eq/ne/gt/gte/lt/lte/
         in/nin/contains/icontains), wildcard ``"*"``, list shorthand (→ IN),
         and compound logical keys ``$and`` / ``$or`` / ``$not``
         (and their unadorned equivalents ``AND`` / ``OR`` / ``NOT``).
 
+        Gap 8 (NULL-safe !=), Gap 11 (boolean normalization), Gap 13 (ISO dates)
+        are all handled inside ``_op_condition()``.
+
         Args:
             filters: Filter dict as passed by the mem0 Memory layer.
 
         Returns:
-            SQL fragment starting with ``WHERE``, or ``""`` when no filters.
+            ``(sql_fragment, params)`` where ``sql_fragment`` starts with
+            ``"WHERE "`` or is ``""`` when no filters apply.
         """
         if not filters:
-            return ""
-        conditions = self._build_conditions(filters)
-        return ("WHERE " + " AND ".join(conditions)) if conditions else ""
+            return "", []
+        params: List[Any] = []
+        conditions = self._build_conditions(filters, params)
+        sql = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        return sql, params
 
-    def _build_conditions(self, filters: Dict[str, Any]) -> List[str]:
-        """Recursively translate a filter dict into a list of SQL condition strings."""
+    def _build_conditions(self, filters: Dict[str, Any], params: List[Any]) -> List[str]:
+        """Recursively translate a filter dict into SQL condition strings.
+
+        Appends bound values to ``params`` when ``self._use_param_bindings``
+        is ``True``; inlines escaped literals otherwise.
+        """
         conditions: List[str] = []
 
         for key, value in filters.items():
@@ -1067,24 +1587,21 @@ class Db2VectorStore(VectorStoreBase):
             logical_op = _LOGICAL_OPS.get(key)
             if logical_op is not None:
                 if logical_op == "NOT":
-                    # $not expects a list of sub-filter dicts; combine with OR
-                    # then negate: NOT (A OR B OR …)
                     if not isinstance(value, list):
                         value = [value]
                     sub_parts: List[str] = []
                     for sub in value:
-                        sub_conds = self._build_conditions(sub)
+                        sub_conds = self._build_conditions(sub, params)
                         if sub_conds:
                             sub_parts.append("(" + " AND ".join(sub_conds) + ")")
                     if sub_parts:
                         conditions.append("NOT (" + " OR ".join(sub_parts) + ")")
                 else:
-                    # $and / $or expect a list of sub-filter dicts
                     if not isinstance(value, list):
                         value = [value]
                     sub_parts = []
                     for sub in value:
-                        sub_conds = self._build_conditions(sub)
+                        sub_conds = self._build_conditions(sub, params)
                         if sub_conds:
                             sub_parts.append("(" + " AND ".join(sub_conds) + ")")
                     if sub_parts:
@@ -1094,69 +1611,131 @@ class Db2VectorStore(VectorStoreBase):
 
             # -- Field-level filters ------------------------------------------
             mf = self._metadata_field
-            json_expr = f"JSON_VALUE(SYSTOOLS.BSON2JSON({mf}), '$.{key}')"
+            # Gap 15 — RETURNING VARCHAR(1000) is required for safe ? bindings;
+            # without it ibm_db segfaults (SIGSEGV) on Db2 12.1.3.
+            if self._use_param_bindings:
+                json_expr = (
+                    f"JSON_VALUE(SYSTOOLS.BSON2JSON({mf}), '$.{key}' RETURNING VARCHAR(1000))"
+                )
+            else:
+                json_expr = f"JSON_VALUE(SYSTOOLS.BSON2JSON({mf}), '$.{key}')"
 
             if value == "*":
-                # Wildcard — match any value; skip condition.
                 continue
 
             if isinstance(value, dict):
                 for op, op_val in value.items():
-                    cond = self._op_condition(json_expr, op, op_val)
+                    cond = self._op_condition(json_expr, op, op_val, params)
                     if cond:
                         conditions.append(cond)
 
             elif isinstance(value, list):
-                escaped = ", ".join(f"'{self._escape_literal(v)}'" for v in value)
-                conditions.append(f"{json_expr} IN ({escaped})")
+                if self._use_param_bindings:
+                    placeholders = ", ".join("?" for _ in value)
+                    params.extend(_normalize_filter_value(v) for v in value)
+                    conditions.append(f"{json_expr} IN ({placeholders})")
+                else:
+                    escaped = ", ".join(f"'{_normalize_filter_value(v)}'" for v in value)
+                    conditions.append(f"{json_expr} IN ({escaped})")
 
             else:
-                conditions.append(f"{json_expr} = '{self._escape_literal(value)}'")
+                # Gap 11 — normalize booleans; handle None → IS NULL.
+                if value is None:
+                    conditions.append(f"{json_expr} IS NULL")
+                elif self._use_param_bindings:
+                    params.append(_normalize_filter_value(value))
+                    conditions.append(f"({json_expr} IS NOT NULL AND {json_expr} = ?)")
+                else:
+                    conditions.append(f"{json_expr} = '{_normalize_filter_value(value)}'")
 
         return conditions
 
-    @staticmethod
-    def _op_condition(json_expr: str, op: str, value: Any) -> str:
+    def _op_condition(
+        self, json_expr: str, op: str, value: Any, params: List[Any]
+    ) -> str:
         """Translate a single operator dict entry into a SQL condition fragment.
+
+        Appends bound values to ``params`` when ``self._use_param_bindings``
+        is ``True``; inlines escaped literals otherwise.
 
         Supported operators: eq, ne, gt, gte, lt, lte, in, nin,
         contains, icontains.
+
+        Gap 8  — NULL-safe ``ne``: ``(field IS NULL OR field <> value)``.
+        Gap 11 — Boolean normalization via ``_normalize_filter_value()``.
+        Gap 13 — ISO date strings pass through as VARCHAR for range ops.
         """
         op = op.lower()
-        esc = Db2VectorStore._escape_literal
+        use_p = self._use_param_bindings
+
+        def _inline(v: Any) -> str:
+            return f"'{_normalize_filter_value(v)}'"
+
+        def _bind(v: Any) -> str:
+            """Append value to params and return '?'."""
+            params.append(_normalize_filter_value(v))
+            return "?"
+
+        _val = _bind if use_p else _inline  # noqa: E731
 
         if op == "eq":
-            return f"{json_expr} = '{esc(value)}'"
+            if value is None:
+                return f"{json_expr} IS NULL"
+            if use_p:
+                params.append(_normalize_filter_value(value))
+                return f"({json_expr} IS NOT NULL AND {json_expr} = ?)"
+            return f"({json_expr} IS NOT NULL AND {json_expr} = {_inline(value)})"
         if op == "ne":
-            return f"{json_expr} <> '{esc(value)}'"
+            if value is None:
+                return f"{json_expr} IS NOT NULL"
+            # Gap 8 — NULL-safe !=: rows where field is absent also match.
+            if use_p:
+                params.append(_normalize_filter_value(value))
+                return f"({json_expr} IS NULL OR {json_expr} <> ?)"
+            return f"({json_expr} IS NULL OR {json_expr} <> {_inline(value)})"
         if op == "gt":
+            if _is_iso_date(value):
+                return f"{json_expr} > {_val(value)}"
             return f"CAST({json_expr} AS DOUBLE) > {float(value)}"
         if op == "gte":
+            if _is_iso_date(value):
+                return f"{json_expr} >= {_val(value)}"
             return f"CAST({json_expr} AS DOUBLE) >= {float(value)}"
         if op == "lt":
+            if _is_iso_date(value):
+                return f"{json_expr} < {_val(value)}"
             return f"CAST({json_expr} AS DOUBLE) < {float(value)}"
         if op == "lte":
+            if _is_iso_date(value):
+                return f"{json_expr} <= {_val(value)}"
             return f"CAST({json_expr} AS DOUBLE) <= {float(value)}"
         if op == "in":
             if not isinstance(value, list):
                 raise ValueError(
                     f"Filter operator 'in' requires a list, got {type(value).__name__}"
                 )
-            escaped = ", ".join(f"'{esc(v)}'" for v in value)
+            if use_p:
+                placeholders = ", ".join("?" for _ in value)
+                params.extend(_normalize_filter_value(v) for v in value)
+                return f"{json_expr} IN ({placeholders})"
+            escaped = ", ".join(f"'{_normalize_filter_value(v)}'" for v in value)
             return f"{json_expr} IN ({escaped})"
         if op == "nin":
             if not isinstance(value, list):
                 raise ValueError(
                     f"Filter operator 'nin' requires a list, got {type(value).__name__}"
                 )
-            escaped = ", ".join(f"'{esc(v)}'" for v in value)
-            return f"{json_expr} NOT IN ({escaped})"
+            if use_p:
+                placeholders = ", ".join("?" for _ in value)
+                params.extend(_normalize_filter_value(v) for v in value)
+                return f"({json_expr} IS NULL OR {json_expr} NOT IN ({placeholders}))"
+            escaped = ", ".join(f"'{_normalize_filter_value(v)}'" for v in value)
+            # Gap 8 — NULL-safe not-in.
+            return f"({json_expr} IS NULL OR {json_expr} NOT IN ({escaped}))"
         if op == "contains":
-            # Substring match — JSON_VALUE returns VARCHAR so LIKE works directly.
-            return f"{json_expr} LIKE '%{esc(value)}%'"
+            return f"{json_expr} LIKE '%{_normalize_filter_value(value)}%'"
         if op == "icontains":
-            # Case-insensitive substring match via LOWER on both sides.
-            return f"LOWER({json_expr}) LIKE LOWER('%{esc(value)}%')"
+            return f"LOWER({json_expr}) LIKE LOWER('%{_normalize_filter_value(value)}%')"
         raise ValueError(
             f"Unsupported filter operator '{op}'. "
             f"Supported: eq, ne, gt, gte, lt, lte, in, nin, contains, icontains"

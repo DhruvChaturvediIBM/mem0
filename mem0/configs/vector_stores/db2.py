@@ -28,11 +28,12 @@ class Db2Config(BaseModel):
             Mapped to ``SSLServerCertificate``.
 
     Connection pooling note:
-        ``ibm_db_dbi`` does not ship a built-in connection pool.  For
-        multi-threaded / web-server deployments, manage a pool externally
-        (e.g. SQLAlchemy with the ``ibm_db_sa`` dialect, or a custom
-        ``threading.local`` wrapper) and pass the per-request connection via
-        the ``client`` parameter rather than using ``connection_params``.
+        When ``connection_params`` is used, the store internally calls
+        ``ibm_db_dbi.pconnect()`` (persistent connection) protected by a
+        ``threading.Lock`` for thread-safe lazy initialisation.  For
+        multi-threaded / web-server deployments this is the recommended path.
+        Alternatively, manage a pool externally and pass the per-request
+        connection via the ``client`` parameter.
     """
 
     client: Optional[Any] = Field(
@@ -67,6 +68,17 @@ class Db2Config(BaseModel):
             "Community Edition (CE) containers (Podman/Docker) — CE drops TCP "
             "connections after CREATE VECTOR INDEX due to in-memory ANN graph "
             "reconstruction.  Keep False (the default) on CE containers."
+        ),
+    )
+
+    # Gap 9 — Schema support: optional SET SCHEMA on connect.
+    # Named db_schema to avoid shadowing Pydantic BaseModel.schema().
+    db_schema: Optional[str] = Field(
+        None,
+        description=(
+            "Optional Db2 schema name.  When set, ``SET SCHEMA <name>`` is "
+            "issued immediately after the connection is established so all "
+            "unqualified table references resolve to this schema."
         ),
     )
 
