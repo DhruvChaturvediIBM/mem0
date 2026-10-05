@@ -64,6 +64,8 @@ from mem0.vector_stores.db2 import (  # noqa: E402
     Db2VectorStore,
     OutputData,
     _distance_to_score,
+    _cosine_similarity,
+    _mmr_select,
 )
 
 # ---------------------------------------------------------------------------
@@ -101,10 +103,10 @@ def _bson_json(d: dict) -> str:
 def _mock_client_cursor(post_init_fetchone=None):
     """Return (client, cursor) with fetchone pre-seeded for Db2VectorStore.__init__.
 
-    __init__ fetchone call order (langchain-db2 backed):
-      1. _check_db2_version      SERVICE_LEVEL       → ("DB2 v12.1.2.0",)
-      2. SYSCAT.COLUMNS check    col exists COUNT(*)  → (1,)  skip ALTER TABLE
-      3. _probe_text_search      CONTAINS probe       → None  (unavailable)
+    __init__ fetchone call order:
+      1. _check_db2_version  SERVICE_LEVEL  → ("DB2 v12.1.2.0",)
+      2. _probe_text_search  CONTAINS probe → None  (text search unavailable)
+      3. _table_exists       COUNT(*)       → (1,)  table exists, skip CREATE TABLE
 
     After those three are consumed, subsequent calls return ``post_init_fetchone``.
     """
@@ -119,10 +121,10 @@ def _mock_client_cursor(post_init_fetchone=None):
             return ("DB2 v12.1.2.0",)  # _check_db2_version SERVICE_LEVEL
         if len(consumed) == 1:
             consumed.append(2)
-            return (1,)                # SYSCAT.COLUMNS → col present, skip ALTER
+            return None                # _probe_text_search CONTAINS probe
         if len(consumed) == 2:
             consumed.append(3)
-            return None                # _probe_text_search CONTAINS probe
+            return (1,)                # _table_exists COUNT(*) → table exists
         # All init calls done — return the per-test value
         return post_init_fetchone
 
@@ -148,15 +150,15 @@ def _store(cursor_rows=None, fetchone_row=None, **kwargs):
     client = MagicMock()
     cursor = MagicMock()
     cursor.fetchall.return_value = cursor_rows or []
-    # fetchone sequence during __init__ (langchain-db2 backed):
-    #   1. _check_db2_version      → version string row
-    #   2. SYSCAT.COLUMNS check    → (1,) column exists → skip ALTER TABLE
-    #   3. _probe_text_search      → None (text search not available)
+    # fetchone sequence during __init__:
+    #   1. _table_exists  → (1,) means table exists → skip CREATE TABLE
+    #   2. _check_db2_version  → version string row
+    #   3. _probe_text_search  → None (text search not available)
     # After construction the cursor is reset; callers that need a specific
     # fetchone_row get it set back on the reset cursor.
     cursor.fetchone.side_effect = [
+        (1,),                   # _table_exists COUNT(*)
         ("DB2 v12.1.2.0",),     # _check_db2_version SERVICE_LEVEL
-        (1,),                   # SYSCAT.COLUMNS COUNT(*) → col present
         None,                   # _probe_text_search CONTAINS probe
     ]
     client.cursor.return_value = cursor
@@ -372,43 +374,31 @@ def test_distance_to_score_rejects_unknown_strategy():
 
 
 class TestDb2VectorStoreInit:
-    def test_creates_table_delegates_to_db2vs(self):
-        # With langchain-db2, table creation is delegated to DB2VS.
-        # _ensure_table_with_extra_cols creates a temporary DB2VS instance
-        # (which calls CREATE TABLE internally), then our code adds the
-        # text_lemmatized column via ALTER TABLE ADD COLUMN.
-        # Verify that ALTER TABLE is emitted when SYSCAT.COLUMNS says
-        # the extra column is absent (COUNT(*) = 0).
+    def test_creates_table_when_absent(self):
+        # fetchone order in __init__: version → probe → table_exists (→ 0 = absent → CREATE)
         client, cursor = _mock_client_cursor()
-        execute_calls = []
-        def _track_execute(sql, *a, **kw):
-            execute_calls.append(sql)
-        cursor.execute.side_effect = _track_execute
-        # SYSCAT.COLUMNS check for text_lemmatized → absent (0)
-        cursor.fetchone.side_effect = [
-            ("DB2 v12.1.2.0",),  # _check_db2_version
-            (0,),                # SYSCAT.COLUMNS check → column absent → ALTER TABLE
-            None,                # _probe_text_search
-        ]
-        Db2VectorStore(client=client, collection_name="T", embedding_model_dims=DIM)
-        assert any("ALTER TABLE" in s for s in execute_calls), (
-            "Expected ALTER TABLE ADD COLUMN for text_lemmatized"
-        )
+        consumed = []
+        def _fetchone_absent(*a, **kw):
+            if len(consumed) == 0:
+                consumed.append(1); return ("DB2 v12.1.2.0",)  # _check_db2_version
+            if len(consumed) == 1:
+                consumed.append(2); return None                 # _probe_text_search
+            consumed.append(3); return (0,)                     # _table_exists → absent
+        cursor.fetchone.side_effect = _fetchone_absent
 
-    def test_skips_alter_when_extra_col_exists(self):
-        # When SYSCAT.COLUMNS says text_lemmatized already exists (COUNT(*) = 1),
-        # no ALTER TABLE should be emitted.
-        client, cursor = _mock_client_cursor()
         execute_calls = []
         cursor.execute.side_effect = lambda sql, *a, **kw: execute_calls.append(sql)
-        # SYSCAT.COLUMNS check → column present (1)
-        cursor.fetchone.side_effect = [
-            ("DB2 v12.1.2.0",),  # _check_db2_version
-            (1,),                # SYSCAT.COLUMNS check → column present
-            None,                # _probe_text_search
-        ]
         Db2VectorStore(client=client, collection_name="T", embedding_model_dims=DIM)
-        assert not any("ALTER TABLE" in s for s in execute_calls)
+
+        assert any("CREATE TABLE" in s for s in execute_calls), "Expected CREATE TABLE DDL"
+
+    def test_skips_create_when_table_exists(self):
+        # _mock_client_cursor returns (1,) for the first _table_exists → table exists.
+        client, cursor = _mock_client_cursor()
+        executed = []
+        cursor.execute.side_effect = lambda sql, *a, **kw: executed.append(sql)
+        Db2VectorStore(client=client, collection_name="T", embedding_model_dims=DIM)
+        assert not any("CREATE TABLE" in s for s in executed)
 
     def test_stores_config_attributes(self):
         store, *_ = _store()
@@ -430,21 +420,22 @@ class TestDb2VectorStoreInit:
         assert store._metadata_field == "meta"
         assert store._embedding_field == "vec"
 
-    def test_alter_table_adds_text_lemmatized_column(self):
-        # When the extra column is absent, ALTER TABLE statement must
-        # reference text_lemmatized by name.
+    # Change 4: text_lemmatized column in DDL
+    def test_create_table_ddl_includes_text_lemmatized_column(self):
         client, cursor = _mock_client_cursor()
+        # Override fetchone so _table_exists returns 0 (table absent)
+        cursor.fetchone.side_effect = [
+            (0,),                   # _table_exists → absent → CREATE TABLE
+            ("DB2 v12.1.2.0",),     # _check_db2_version
+            None,                   # _probe_text_search
+        ]
         execute_calls = []
         cursor.execute.side_effect = lambda sql, *a, **kw: execute_calls.append(sql)
-        cursor.fetchone.side_effect = [
-            ("DB2 v12.1.2.0",),  # _check_db2_version
-            (0,),                # SYSCAT.COLUMNS → column absent
-            None,                # _probe_text_search
-        ]
         Db2VectorStore(client=client, collection_name="T", embedding_model_dims=DIM)
-        alter_stmts = [s for s in execute_calls if "ALTER TABLE" in s]
-        assert alter_stmts, "Expected ALTER TABLE DDL"
-        assert "text_lemmatized" in alter_stmts[0]
+
+        create_stmts = [s for s in execute_calls if "CREATE TABLE" in s]
+        assert create_stmts, "Expected CREATE TABLE DDL"
+        assert "text_lemmatized" in create_stmts[0]
 
 
 # ===========================================================================
@@ -509,33 +500,23 @@ class TestInsert:
         ids = store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]], ids=provided)
         assert ids == provided
 
-    def test_insert_calls_executemany_twice(self):
-        # insert() calls executemany twice:
-        #   1. DB2VS.add_texts  → INSERT INTO … (zero-vector shim)
-        #   2. Our patch-up     → UPDATE … SET embedding = VECTOR(?), text_lemmatized = ?
+    def test_insert_calls_executemany(self):
         store, _, cursor = _store()
         store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]], payloads=[{"user_id": "alice"}])
-        assert cursor.executemany.call_count == 2
-        # First call must be an INSERT
-        first_sql = cursor.executemany.call_args_list[0][0][0]
-        assert "INSERT INTO" in first_sql
-        assert "VECTOR(" in first_sql
-        # Second call must be the UPDATE that patches real vectors + text_lemmatized
-        second_sql = cursor.executemany.call_args_list[1][0][0]
-        assert "UPDATE" in second_sql
-        assert "text_lemmatized" in second_sql
+        cursor.executemany.assert_called_once()
+        sql = cursor.executemany.call_args[0][0]
+        assert "INSERT INTO" in sql
+        assert "VECTOR(" in sql
 
     def test_insert_commits(self):
         store, client, _ = _store()
         store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]])
-        # Two executemany calls → two commits (one for DB2VS insert, one for our UPDATE)
-        assert client.commit.call_count >= 1
+        client.commit.assert_called_once()
 
     def test_insert_fills_missing_payloads_with_empty_dicts(self):
         store, _, cursor = _store()
         store.insert(vectors=[[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]])
-        # Second executemany is our UPDATE; check its row count
-        rows = cursor.executemany.call_args_list[1][0][1]
+        rows = cursor.executemany.call_args[0][1]
         assert len(rows) == 2
 
     def test_insert_multiple_vectors_in_one_call(self):
@@ -544,28 +525,26 @@ class TestInsert:
         ids = store.insert(vectors=vecs)
         assert len(ids) == 5
 
+    # Change 4: text_lemmatized populated on insert
     def test_insert_populates_text_lemmatized_from_payload(self):
-        # text_lemmatized is written via the UPDATE executemany (2nd call).
-        # row tuple for UPDATE: (vec_str, text_lemmatized, hashed_id)
         store, _, cursor = _store()
         payload = {"data": "raw text", "text_lemmatized": "stem text"}
         store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]], payloads=[payload])
-        update_rows = cursor.executemany.call_args_list[1][0][1]
-        # update row: (vec_str, text_lemmatized, hashed_id)
-        assert update_rows[0][1] == "stem text"
+        rows = cursor.executemany.call_args[0][1]
+        # row tuple: (id, vec_str, json_meta, text, text_lemmatized)
+        assert rows[0][4] == "stem text"
 
     def test_insert_text_lemmatized_defaults_to_empty_string(self):
         store, _, cursor = _store()
         store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]], payloads=[{"data": "hello"}])
-        update_rows = cursor.executemany.call_args_list[1][0][1]
-        assert update_rows[0][1] == ""
+        rows = cursor.executemany.call_args[0][1]
+        assert rows[0][4] == ""
 
     def test_insert_sql_includes_text_lemmatized_column(self):
-        # The UPDATE (2nd executemany) must reference text_lemmatized.
         store, _, cursor = _store()
         store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]])
-        update_sql = cursor.executemany.call_args_list[1][0][0]
-        assert "text_lemmatized" in update_sql
+        sql = cursor.executemany.call_args[0][0]
+        assert "text_lemmatized" in sql
 
 
 # ===========================================================================
@@ -690,28 +669,23 @@ class TestSearch:
 
 
 class TestDelete:
-    def test_delete_issues_delete_sql(self):
-        # delete() delegates to DB2VS.delete which issues a DELETE … WHERE id IN (?)
-        # with the SHA-256-hashed id.  Verify DELETE SQL is issued and COMMIT follows.
-        store, client, cursor = _store()
+    def test_delete_passes_id_as_is(self):
+        store, _, cursor = _store()
         vid = str(uuid.uuid4())
         store.delete(vid)
-        all_sqls = [c[0][0] for c in cursor.execute.call_args_list]
-        assert any("DELETE" in s for s in all_sqls), "Expected DELETE SQL"
+        _, params = cursor.execute.call_args[0]
+        assert params == [vid]
 
     def test_delete_commits(self):
-        store, client, cursor = _store()
+        store, client, _ = _store()
         store.delete("some-id")
-        # DB2VS.delete calls cursor.execute("COMMIT") internally
-        all_sqls = [c[0][0] for c in cursor.execute.call_args_list]
-        assert any("COMMIT" in s or "commit" in s.lower() for s in all_sqls) or \
-               client.commit.called, "Expected COMMIT after delete"
+        client.commit.assert_called_once()
 
     def test_delete_sql_targets_correct_table(self):
         store, _, cursor = _store(collection_name="MY_TABLE")
         store.delete("abc")
-        all_sqls = [c[0][0] for c in cursor.execute.call_args_list]
-        assert any("MY_TABLE" in s for s in all_sqls), "Expected table name in DELETE SQL"
+        sql = cursor.execute.call_args[0][0]
+        assert "MY_TABLE" in sql
 
 
 # ===========================================================================
@@ -794,15 +768,12 @@ class TestGet:
         store, _ = self._make_store(None)
         assert store.get("does-not-exist") is None
 
-    def test_get_hashes_uuid_id_to_char16(self):
-        # DB2VS stores CHAR(16) SHA-256 hashes; get() must hash the UUID before WHERE.
-        import hashlib as _hl
+    def test_get_passes_id_unchanged(self):
         vid = str(uuid.uuid4())
-        expected_hid = _hl.sha256(vid.encode()).hexdigest()[:16].upper()
         store, cursor = self._make_store(None)
         store.get(vid)
         _, params = cursor.execute.call_args[0]
-        assert params == [expected_hid]
+        assert params == [vid]
 
     def test_get_null_metadata_treated_as_empty_dict(self):
         store, _ = self._make_store(("ID", "txt", None))
@@ -848,13 +819,11 @@ class TestDeleteCol:
         assert any("DROP TABLE" in s for s in sqls)
 
     def test_skip_drop_when_table_missing(self):
-        # langchain-db2 drop_table checks existence by catching SQL0204N.
-        # When cursor.execute raises SQL0204N, drop_table skips DROP TABLE.
         client = MagicMock()
         cursor = MagicMock()
         client.cursor.return_value = cursor
-        # Simulate table absent: SELECT COUNT(*) raises SQL0204N
-        cursor.execute.side_effect = Exception("SQL0204N table not found")
+        # _table_exists returns False (COUNT(*) = 0) → delete_col logs and returns
+        cursor.fetchone.return_value = (0,)
 
         store = Db2VectorStore.__new__(Db2VectorStore)
         store.client = client
@@ -866,11 +835,9 @@ class TestDeleteCol:
         store._embedding_field = "embedding"
         store._distance_strategy = "EUCLIDEAN"
         store._embedding_dim = DIM
-        store._db2vs = MagicMock()
 
         store.delete_col()
-        sqls = [str(c) for c in cursor.execute.call_args_list]
-        # No DROP TABLE should have been issued — table was absent
+        sqls = [c[0][0] for c in cursor.execute.call_args_list]
         assert not any("DROP TABLE" in s for s in sqls)
 
 
@@ -1009,20 +976,24 @@ class TestList:
 
 class TestReset:
     def test_reset_drops_and_recreates(self):
-        # reset() calls: drop_table (→ DROP TABLE) + _ensure_table_with_extra_cols
-        # (DB2VS handles CREATE TABLE internally) + SYSCAT.COLUMNS check.
         store, _, cursor = _store()
         executed_sqls = []
+        fetchone_calls = [0]
 
-        cursor.fetchone.return_value = (1,)  # SYSCAT.COLUMNS → col present
+        def _fetchone(*a, **kw):
+            # First COUNT(*) → (1,) table exists → delete_col issues DROP TABLE
+            # Second COUNT(*) → (0,) table gone → _create_table_if_not_exists runs CREATE
+            fetchone_calls[0] += 1
+            if fetchone_calls[0] == 1:
+                return (1,)   # _table_exists before drop → table present
+            return (0,)       # _table_exists after drop → table absent → CREATE TABLE
+
+        cursor.fetchone.side_effect = _fetchone
         cursor.execute.side_effect = lambda sql, *a, **kw: executed_sqls.append(sql)
         store.reset()
 
         assert any("DROP TABLE" in s for s in executed_sqls), "Expected DROP TABLE"
-        # Table recreation delegated to DB2VS; we verify SYSCAT.COLUMNS check ran
-        assert any("SYSCAT" in s for s in executed_sqls), (
-            "Expected SYSCAT.COLUMNS check during _ensure_table_with_extra_cols"
-        )
+        assert any("CREATE TABLE" in s for s in executed_sqls), "Expected CREATE TABLE"
 
 
 # ===========================================================================
@@ -1645,3 +1616,131 @@ def test_live_documentation():
     assert len(results) >= 1
     assert all(res["user_id"] == "alice" for res in results)
     m.reset()
+
+
+# ===========================================================================
+# MMR helper unit tests
+# ===========================================================================
+
+
+class TestCosimeSimilarity:
+    def test_identical_vectors(self):
+        v = [1.0, 0.0, 0.0]
+        assert _cosine_similarity(v, v) == pytest.approx(1.0)
+
+    def test_orthogonal_vectors(self):
+        assert _cosine_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
+
+    def test_opposite_vectors(self):
+        assert _cosine_similarity([1.0, 0.0], [-1.0, 0.0]) == pytest.approx(-1.0)
+
+    def test_zero_vector_returns_zero(self):
+        assert _cosine_similarity([0.0, 0.0], [1.0, 0.0]) == 0.0
+
+
+class TestMmrSelect:
+    def _items(self, n):
+        return [f"item_{i}" for i in range(n)]
+
+    def test_returns_k_items(self):
+        vecs = [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [-1.0, 0.0]]
+        items = self._items(4)
+        result = _mmr_select([1.0, 0.0], vecs, items, k=2, lambda_mult=0.5)
+        assert len(result) == 2
+
+    def test_returns_empty_for_no_candidates(self):
+        assert _mmr_select([1.0, 0.0], [], [], k=3, lambda_mult=0.5) == []
+
+    def test_lambda_1_returns_top_relevant(self):
+        # lambda=1.0: pure relevance → first result should be the most similar item.
+        query = [1.0, 0.0]
+        vecs = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
+        items = ["close", "orthogonal", "opposite"]
+        result = _mmr_select(query, vecs, items, k=1, lambda_mult=1.0)
+        assert result[0] == "close"
+
+    def test_lambda_0_maximises_diversity(self):
+        # lambda=0.0: pure diversity → after first pick, second pick must be
+        # maximally distant from the first.
+        query = [1.0, 0.0]
+        vecs = [[1.0, 0.0], [0.9, 0.1], [-1.0, 0.0]]
+        items = ["close", "near", "opposite"]
+        result = _mmr_select(query, vecs, items, k=2, lambda_mult=0.0)
+        assert len(result) == 2
+        assert result[0] != result[1]
+
+    def test_k_capped_at_candidate_count(self):
+        vecs = [[1.0, 0.0], [0.0, 1.0]]
+        items = self._items(2)
+        result = _mmr_select([1.0, 0.0], vecs, items, k=10, lambda_mult=0.5)
+        assert len(result) == 2
+
+    def test_all_items_returned_when_k_equals_len(self):
+        vecs = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
+        items = self._items(3)
+        result = _mmr_select([1.0, 0.0], vecs, items, k=3, lambda_mult=0.5)
+        assert len(result) == 3
+        assert set(result) == set(items)
+
+
+class TestMmrSearch:
+    def _setup(self, rows):
+        """Build store + cursor with fetchall seeded to ``rows``."""
+        client, cursor = _mock_client_cursor()
+        cursor.fetchall.return_value = rows
+        store = Db2VectorStore(client=client, collection_name="T", embedding_model_dims=DIM)
+        cursor.reset_mock()
+        client.cursor.return_value = cursor
+        cursor.fetchall.return_value = rows
+        return store, cursor
+
+    def _row(self, id_, distance, emb):
+        """Build a mock DB row: (id, text, metadata_json, distance, emb_str)."""
+        emb_str = "[" + ", ".join(str(v) for v in emb) + "]"
+        return (id_, "text", _bson_json({}), distance, emb_str)
+
+    def test_returns_output_data_list(self):
+        rows = [
+            self._row("ID1", 0.1, [1.0, 0.0, 0.0, 0.0]),
+            self._row("ID2", 0.5, [0.0, 1.0, 0.0, 0.0]),
+        ]
+        store, cursor = self._setup(rows)
+        results = store.mmr_search(query="q", vectors=[[1.0, 0.0, 0.0, 0.0]], top_k=2)
+        assert len(results) <= 2
+        assert all(isinstance(r, OutputData) for r in results)
+
+    def test_returns_empty_when_no_rows(self):
+        store, cursor = self._setup([])
+        results = store.mmr_search(query="q", vectors=[[1.0, 0.0, 0.0, 0.0]], top_k=3)
+        assert results == []
+
+    def test_fetch_k_in_sql(self):
+        store, cursor = self._setup([])
+        store.mmr_search(query="q", vectors=[[1.0, 0.0, 0.0, 0.0]], top_k=2, fetch_k=15)
+        sql = cursor.execute.call_args[0][0]
+        assert "15" in sql
+
+    def test_fetch_k_defaults_to_top_k_when_smaller(self):
+        store, cursor = self._setup([])
+        store.mmr_search(query="q", vectors=[[1.0, 0.0, 0.0, 0.0]], top_k=5, fetch_k=2)
+        sql = cursor.execute.call_args[0][0]
+        assert "5" in sql
+
+    def test_sql_includes_vector_serialize(self):
+        store, cursor = self._setup([])
+        store.mmr_search(query="q", vectors=[[1.0, 0.0, 0.0, 0.0]])
+        sql = cursor.execute.call_args[0][0]
+        assert "VECTOR_SERIALIZE" in sql
+
+    def test_with_filter(self):
+        store, cursor = self._setup([])
+        store.mmr_search(query="q", vectors=[[1.0, 0.0, 0.0, 0.0]], filters={"user_id": "alice"})
+        sql = cursor.execute.call_args[0][0]
+        assert "WHERE" in sql and "user_id" in sql
+
+    def test_top_k_limits_output(self):
+        # Even if fetch_k rows returned, output must be at most top_k.
+        rows = [self._row(f"ID{i}", float(i) * 0.1, [1.0 - i * 0.1] + [0.0] * (DIM - 1)) for i in range(4)]
+        store, cursor = self._setup(rows)
+        results = store.mmr_search(query="q", vectors=[[1.0, 0.0, 0.0, 0.0]], top_k=2, fetch_k=4)
+        assert len(results) <= 2
