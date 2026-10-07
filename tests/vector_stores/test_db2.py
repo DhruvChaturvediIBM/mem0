@@ -33,7 +33,7 @@ import sys
 import uuid
 from pathlib import Path
 from types import ModuleType
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1756,8 +1756,6 @@ class TestMmrSelectNumpy:
         items = self._items(4)
 
         np_result = _mmr_select_numpy(query, vecs, items, k=3, lambda_mult=0.5)
-        py_result = _mmr_select.__wrapped__(query, vecs, items, k=3, lambda_mult=0.5) \
-            if hasattr(_mmr_select, "__wrapped__") else None
 
         # Verify numpy result is well-formed (correct length, known items).
         assert len(np_result) == 3
