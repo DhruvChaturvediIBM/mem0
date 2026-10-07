@@ -388,10 +388,13 @@ class TestDb2VectorStoreInit:
         consumed = []
         def _fetchone_absent(*a, **kw):
             if len(consumed) == 0:
-                consumed.append(1); return ("DB2 v12.1.2.0",)  # _check_db2_version
+                consumed.append(1)
+                return ("DB2 v12.1.2.0",)  # _check_db2_version
             if len(consumed) == 1:
-                consumed.append(2); return None                 # _probe_text_search
-            consumed.append(3); return (0,)                     # _table_exists → absent
+                consumed.append(2)
+                return None  # _probe_text_search
+            consumed.append(3)
+            return (0,)  # _table_exists → absent
         cursor.fetchone.side_effect = _fetchone_absent
 
         execute_calls = []
@@ -1263,8 +1266,8 @@ class TestKeywordSearch:
         sql = cursor.execute.call_args[0][0]
         assert "text_lemmatized" in sql
         # Must NOT use the raw text column for CONTAINS/SCORE
-        assert f"CONTAINS(text," not in sql
-        assert f"SCORE(text," not in sql
+        assert "CONTAINS(text," not in sql
+        assert "SCORE(text," not in sql
 
     def test_keyword_search_with_filters(self):
         store, cursor = self._make_store(True)
