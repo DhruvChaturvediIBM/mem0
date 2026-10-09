@@ -104,10 +104,9 @@ def _mock_client_cursor(post_init_fetchone=None):
     __init__ fetchone call order:
       1. _check_db2_version    SERVICE_LEVEL  → ("DB2 v12.1.2.0",)
       2. _probe_text_search    CONTAINS probe → None  (text search unavailable)
-      3. _probe_param_bindings ? binding probe → ("ok",)  bindings supported
-      4. _table_exists         COUNT(*)       → (1,)  table exists, skip CREATE TABLE
+      3. _table_exists         COUNT(*)       → (1,)  table exists, skip CREATE TABLE
 
-    After those four are consumed, subsequent calls return ``post_init_fetchone``.
+    After those are consumed, subsequent calls return ``post_init_fetchone``.
     """
     client = MagicMock()
     cursor = MagicMock()
@@ -123,9 +122,6 @@ def _mock_client_cursor(post_init_fetchone=None):
             return None                # _probe_text_search CONTAINS probe
         if len(consumed) == 2:
             consumed.append(3)
-            return ("ok",)             # _probe_param_bindings ? binding probe
-        if len(consumed) == 3:
-            consumed.append(4)
             return (1,)                # _table_exists COUNT(*) → table exists
         # All init calls done — return the per-test value
         return post_init_fetchone
@@ -155,14 +151,12 @@ def _store(cursor_rows=None, fetchone_row=None, **kwargs):
     # fetchone sequence during __init__ (in call order):
     #   1. _check_db2_version      → version string row
     #   2. _probe_text_search      → None (text search not available)
-    #   3. _probe_param_bindings   → ("ok",) probe succeeds → use ? bindings
-    #   4. _table_exists           → (1,) means table exists → skip CREATE TABLE
+    #   3. _table_exists           → (1,) means table exists → skip CREATE TABLE
     # After construction the cursor is reset; callers that need a specific
     # fetchone_row get it set back on the reset cursor.
     cursor.fetchone.side_effect = [
         ("DB2 v12.1.2.0",),     # _check_db2_version SERVICE_LEVEL
         None,                   # _probe_text_search CONTAINS probe
-        ("ok",),                # _probe_param_bindings ? binding probe
         (1,),                   # _table_exists COUNT(*) → table exists
     ]
     client.cursor.return_value = cursor
@@ -423,7 +417,6 @@ class TestDb2VectorStoreInit:
         cursor.fetchone.side_effect = [
             ("DB2 v12.1.2.0",),     # _check_db2_version
             None,                   # _probe_text_search
-            ("ok",),                # _probe_param_bindings
             (0,),                   # _table_exists → absent → CREATE TABLE
         ]
         execute_calls = []
@@ -1048,21 +1041,22 @@ class TestWhereClause:
         clause = self._clause(store, {"key": "val"})
         assert "my_meta" in clause
 
-    # Change 2: contains / icontains
     def test_contains_operator_produces_like(self):
         s = self._store()
-        clause = self._clause(s, {"category": {"contains": "sci"}})
-        assert "LIKE" in clause and "%sci%" in clause
+        sql, params = self._sql_and_params(s, {"category": {"contains": "sci"}})
+        assert "LIKE ?" in sql
+        assert "%sci%" in params
 
     def test_icontains_operator_produces_lower_like(self):
         s = self._store()
-        clause = self._clause(s, {"category": {"icontains": "Sci"}})
-        assert "LOWER" in clause and "LIKE" in clause and "%sci%" in clause.lower()
+        sql, params = self._sql_and_params(s, {"category": {"icontains": "Sci"}})
+        assert "LOWER" in sql and "LIKE LOWER(?)" in sql
+        assert "%Sci%" in params
 
     def test_contains_escapes_single_quotes(self):
         s = self._store()
-        clause = self._clause(s, {"note": {"contains": "it's"}})
-        assert "it''s" in clause
+        sql, params = self._sql_and_params(s, {"note": {"contains": "it's"}})
+        assert "%it''s%" in params
 
     # Change 3: $or / $not / $and logical operators
     def test_or_filter_produces_sql_or(self):
@@ -1128,52 +1122,55 @@ class TestWhereClause:
 
 
 class TestOpCondition:
-    """_op_condition is now an instance method — use a mock store with
-    _use_param_bindings=False to exercise the inline-escaping path."""
+    """_op_condition unit tests using parameterized bindings."""
 
     def _store(self):
         s, *_ = _store()
-        s._use_param_bindings = False  # force inline path for these unit tests
         return s
 
     def _expr(self):
-        return "JSON_VALUE(SYSTOOLS.BSON2JSON(metadata), '$.field')"
+        return "JSON_VALUE(SYSTOOLS.BSON2JSON(metadata), '$.field' RETURNING VARCHAR(1000))"
 
     def _op(self, op, value):
         params: list = []
-        return self._store()._op_condition(self._expr(), op, value, params)
+        cond = self._store()._op_condition(self._expr(), op, value, params)
+        return cond, params
 
     def test_eq(self):
-        cond = self._op("eq", "val")
-        assert "= 'val'" in cond
+        cond, params = self._op("eq", "val")
+        assert "= ?" in cond
+        assert "val" in params
 
     def test_ne(self):
-        cond = self._op("ne", "val")
-        assert "<> 'val'" in cond
+        cond, params = self._op("ne", "val")
+        assert "<> ?" in cond
+        assert "val" in params
 
     def test_gt(self):
-        cond = self._op("gt", 5)
+        cond, _ = self._op("gt", 5)
         assert "> 5.0" in cond and "DOUBLE" in cond
 
     def test_gte(self):
-        cond = self._op("gte", 5)
+        cond, _ = self._op("gte", 5)
         assert ">= 5.0" in cond
 
     def test_lt(self):
-        cond = self._op("lt", 5)
+        cond, _ = self._op("lt", 5)
         assert "< 5.0" in cond
 
     def test_lte(self):
-        cond = self._op("lte", 5)
+        cond, _ = self._op("lte", 5)
         assert "<= 5.0" in cond
 
     def test_in(self):
-        cond = self._op("in", ["a", "b"])
-        assert "IN" in cond and "'a'" in cond and "'b'" in cond
+        cond, params = self._op("in", ["a", "b"])
+        assert "IN (?, ?)" in cond
+        assert "a" in params and "b" in params
 
     def test_nin(self):
-        cond = self._op("nin", ["a", "b"])
-        assert "NOT IN" in cond
+        cond, params = self._op("nin", ["a", "b"])
+        assert "NOT IN (?, ?)" in cond
+        assert "a" in params and "b" in params
 
     def test_in_requires_list(self):
         with pytest.raises(ValueError, match="requires a list"):
@@ -1183,14 +1180,15 @@ class TestOpCondition:
         with pytest.raises(ValueError, match="requires a list"):
             self._op("nin", "not-a-list")
 
-    # Change 2
     def test_contains_produces_like(self):
-        cond = self._op("contains", "sci")
-        assert "LIKE '%sci%'" in cond
+        cond, params = self._op("contains", "sci")
+        assert "LIKE ?" in cond
+        assert "%sci%" in params
 
     def test_icontains_produces_lower_like(self):
-        cond = self._op("icontains", "Sci")
-        assert "LOWER(" in cond and "LIKE" in cond
+        cond, params = self._op("icontains", "Sci")
+        assert "LOWER(" in cond and "LIKE LOWER(?)" in cond
+        assert "%Sci%" in params
 
     def test_unsupported_operator_raises(self):
         with pytest.raises(ValueError, match="Unsupported filter operator"):
@@ -1646,7 +1644,6 @@ class TestPersistentConnection:
             mock_cursor.fetchone.side_effect = [
                 ("DB2 v12.1.2.0",),   # _check_db2_version
                 None,                  # _probe_text_search
-                ("ok",),               # _probe_param_bindings
                 (1,),                  # _table_exists → table exists, skip CREATE
             ]
             mock_conn.cursor.return_value = mock_cursor
@@ -1697,7 +1694,6 @@ class TestSchemaSupport:
             mock_cursor.fetchone.side_effect = [
                 ("DB2 v12.1.2.0",),   # _check_db2_version
                 None,                  # _probe_text_search
-                ("ok",),               # _probe_param_bindings
                 (1,),                  # _table_exists → table exists, skip CREATE
             ]
             mock_conn.cursor.return_value = mock_cursor
@@ -1857,89 +1853,92 @@ class TestNullEmbeddingAndSQL0801N:
 class TestFilterImprovements:
     def _store(self):
         s, *_ = _store()
-        s._use_param_bindings = False  # exercise inline-escape path
         return s
 
     def _op(self, op, value):
-        """Call _op_condition via a store instance with inline escaping."""
         params: list = []
-        return self._store()._op_condition("f", op, value, params)
+        cond = self._store()._op_condition("f", op, value, params)
+        return cond, params
 
-    def _clause(self, s, filters):
-        sql, _params = s._where_clause(filters)
-        return sql
+    def _clause_and_params(self, s, filters):
+        return s._where_clause(filters)
 
     def test_eq_operator_null_safe(self):
         """eq must wrap with IS NOT NULL to avoid SQL UNKNOWN."""
-        cond = self._op("eq", "val")
+        cond, params = self._op("eq", "val")
         assert "IS NOT NULL" in cond
-        assert "= 'val'" in cond
+        assert "= ?" in cond
+        assert "val" in params
 
     def test_ne_operator_null_safe(self):
-        """ne must include (f IS NULL OR f <> 'val') so absent fields match."""
-        cond = self._op("ne", "val")
+        """ne must include (f IS NULL OR f <> ?) so absent fields match."""
+        cond, params = self._op("ne", "val")
         assert "IS NULL" in cond
-        assert "<> 'val'" in cond
+        assert "<> ?" in cond
+        assert "val" in params
 
     def test_nin_operator_null_safe(self):
-        """nin must include (f IS NULL OR f NOT IN (...))."""
-        cond = self._op("nin", ["a", "b"])
+        """nin must include (f IS NULL OR f NOT IN (?))."""
+        cond, params = self._op("nin", ["a", "b"])
         assert "IS NULL" in cond
-        assert "NOT IN" in cond
+        assert "NOT IN (?, ?)" in cond
+        assert "a" in params and "b" in params
 
     def test_eq_none_produces_is_null(self):
         """eq with None value → IS NULL."""
-        cond = self._op("eq", None)
+        cond, _ = self._op("eq", None)
         assert "IS NULL" in cond
         assert "IS NOT NULL" not in cond
 
     def test_ne_none_produces_is_not_null(self):
         """ne with None value → IS NOT NULL."""
-        cond = self._op("ne", None)
+        cond, _ = self._op("ne", None)
         assert "IS NOT NULL" in cond
 
     def test_boolean_true_normalized_to_lowercase(self):
-        """Python True → 'true' in SQL (not 'True')."""
+        """Python True → 'true' in params."""
         s = self._store()
-        clause = self._clause(s, {"active": True})
-        assert "'true'" in clause
-        assert "'True'" not in clause
+        sql, params = self._clause_and_params(s, {"active": True})
+        assert "= ?" in sql
+        assert "true" in params
 
     def test_boolean_false_normalized_to_lowercase(self):
-        """Python False → 'false' in SQL."""
+        """Python False → 'false' in params."""
         s = self._store()
-        clause = self._clause(s, {"active": False})
-        assert "'false'" in clause
-        assert "'False'" not in clause
+        sql, params = self._clause_and_params(s, {"active": False})
+        assert "= ?" in sql
+        assert "false" in params
 
     def test_boolean_in_op_condition(self):
-        """eq operator with bool → normalized."""
-        cond = self._op("eq", True)
-        assert "'true'" in cond
+        """eq operator with bool → normalized in params."""
+        cond, params = self._op("eq", True)
+        assert "= ?" in cond
+        assert "true" in params
 
     def test_iso_date_gt_uses_varchar_comparison(self):
-        """ISO date string in gt → VARCHAR comparison, not CAST AS DOUBLE."""
-        cond = self._op("gt", "2024-01-01T00:00:00")
+        """ISO date string in gt → VARCHAR comparison with param."""
+        cond, params = self._op("gt", "2024-01-01T00:00:00")
         assert "CAST" not in cond
-        assert "2024-01-01T00:00:00" in cond
-        assert ">" in cond
+        assert "> ?" in cond
+        assert "2024-01-01T00:00:00" in params
 
     def test_iso_date_lte_uses_varchar_comparison(self):
-        """ISO date in lte → VARCHAR comparison."""
-        cond = self._op("lte", "2024-12-31")
+        """ISO date in lte → VARCHAR comparison with param."""
+        cond, params = self._op("lte", "2024-12-31")
         assert "CAST" not in cond
-        assert "<=" in cond
+        assert "<= ?" in cond
+        assert "2024-12-31" in params
 
     def test_numeric_gt_still_uses_cast_double(self):
         """Numeric values still use CAST AS DOUBLE."""
-        cond = self._op("gt", 42)
+        cond, _ = self._op("gt", 42)
         assert "CAST" in cond and "DOUBLE" in cond
 
     def test_none_value_in_flat_filter_produces_is_null(self):
         """Flat filter {field: None} → IS NULL."""
         s = self._store()
-        clause = self._clause(s, {"status": None})
-        assert "IS NULL" in clause
+        sql, _ = self._clause_and_params(s, {"status": None})
+        assert "IS NULL" in sql
 
     def test_normalize_filter_value_helper(self):
         from mem0.vector_stores.db2 import _normalize_filter_value

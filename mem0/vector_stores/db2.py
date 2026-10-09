@@ -269,11 +269,6 @@ class Db2VectorStore(VectorStoreBase):
         # Probe once at startup whether Db2 Text Search is installed.
         self._text_search_available: bool = self._probe_text_search()
 
-        # Probe once whether the driver supports ? bindings inside
-        # JSON_VALUE(SYSTOOLS.BSON2JSON(...) RETURNING VARCHAR(1000)) predicates.
-        # Falls back to inline-escaped literals automatically if the probe fails.
-        self._use_param_bindings: bool = self._probe_param_bindings()
-
         # Ensure table exists up front so failures surface at construction time.
         _create_table_if_not_exists(
             self.client,
@@ -874,35 +869,6 @@ class Db2VectorStore(VectorStoreBase):
             )
         return available
 
-    def _probe_param_bindings(self) -> bool:
-        """Return ``True`` if the driver safely handles ``?`` bindings inside
-        ``JSON_VALUE(SYSTOOLS.BSON2JSON(...) RETURNING VARCHAR(1000))`` predicates.
-
-        Omitting ``RETURNING VARCHAR(1000)`` can cause a NULL-pointer dereference
-        in ibm_db on some Db2 versions.  This probe verifies safe support at
-        connect time; falls back to inline escaping if the probe fails.
-        """
-        probe_sql = (
-            "SELECT JSON_VALUE(SYSTOOLS.BSON2JSON(v), '$.x' RETURNING VARCHAR(1000)) "
-            "FROM (VALUES (SYSTOOLS.JSON2BSON('{\"x\":\"ok\"}'))) AS t(v) "
-            "WHERE JSON_VALUE(SYSTOOLS.BSON2JSON(v), '$.x' RETURNING VARCHAR(1000)) = ?"
-        )
-        try:
-            with self._get_cursor() as cursor:
-                cursor.execute(probe_sql, ["ok"])
-                cursor.fetchone()
-            logger.debug(
-                "Parameterized ? bindings supported — filter predicates will use "
-                "RETURNING VARCHAR(1000) + ?."
-            )
-            return True
-        except Exception as exc:
-            logger.debug(
-                "Parameterized ? bindings probe failed (%s) — falling back to "
-                "inline-escaped literals for filter predicates.", exc
-            )
-            return False
-
     def _check_db2_version(self) -> None:
         """Raise ``RuntimeError`` if the connected Db2 is below ``_MIN_DB2_VERSION``."""
         sql = "SELECT SERVICE_LEVEL FROM SYSIBMADM.ENV_INST_INFO"  # noqa: S608
@@ -995,9 +961,8 @@ class Db2VectorStore(VectorStoreBase):
         Returns a ``(sql_fragment, params)`` tuple for use with
         ``cursor.execute(sql, params)``.
 
-        When ``self._use_param_bindings`` is ``True``, field values are bound
-        with ``?`` inside ``JSON_VALUE(… RETURNING VARCHAR(1000))``.  When
-        ``False``, values are inlined as escaped literals.
+        Field values are bound with parameterized ``?`` placeholders inside
+        ``JSON_VALUE(… RETURNING VARCHAR(1000))``.
 
         Supports flat equality, operator dicts (eq/ne/gt/gte/lt/lte/in/nin/
         contains/icontains), wildcard ``"*"``, list shorthand (→ IN), and
@@ -1019,11 +984,7 @@ class Db2VectorStore(VectorStoreBase):
         return sql, params
 
     def _build_conditions(self, filters: Dict[str, Any], params: List[Any]) -> List[str]:
-        """Recursively translate a filter dict into SQL condition strings.
-
-        Appends bound values to ``params`` when ``self._use_param_bindings``
-        is ``True``; inlines escaped literals otherwise.
-        """
+        """Recursively translate a filter dict into SQL condition strings."""
         conditions: List[str] = []
 
         for key, value in filters.items():
@@ -1053,13 +1014,9 @@ class Db2VectorStore(VectorStoreBase):
                 continue
 
             mf = self._metadata_field
-            # RETURNING VARCHAR(1000) required for safe ? bindings.
-            if self._use_param_bindings:
-                json_expr = (
-                    f"JSON_VALUE(SYSTOOLS.BSON2JSON({mf}), '$.{key}' RETURNING VARCHAR(1000))"
-                )
-            else:
-                json_expr = f"JSON_VALUE(SYSTOOLS.BSON2JSON({mf}), '$.{key}')"
+            json_expr = (
+                f"JSON_VALUE(SYSTOOLS.BSON2JSON({mf}), '$.{key}' RETURNING VARCHAR(1000))"
+            )
 
             if value == "*":
                 continue
@@ -1071,22 +1028,16 @@ class Db2VectorStore(VectorStoreBase):
                         conditions.append(cond)
 
             elif isinstance(value, list):
-                if self._use_param_bindings:
-                    placeholders = ", ".join("?" for _ in value)
-                    params.extend(_normalize_filter_value(v) for v in value)
-                    conditions.append(f"{json_expr} IN ({placeholders})")
-                else:
-                    escaped = ", ".join(f"'{_normalize_filter_value(v)}'" for v in value)
-                    conditions.append(f"{json_expr} IN ({escaped})")
+                placeholders = ", ".join("?" for _ in value)
+                params.extend(_normalize_filter_value(v) for v in value)
+                conditions.append(f"{json_expr} IN ({placeholders})")
 
             else:
                 if value is None:
                     conditions.append(f"{json_expr} IS NULL")
-                elif self._use_param_bindings:
+                else:
                     params.append(_normalize_filter_value(value))
                     conditions.append(f"({json_expr} IS NOT NULL AND {json_expr} = ?)")
-                else:
-                    conditions.append(f"{json_expr} = '{_normalize_filter_value(value)}'")
 
         return conditions
 
@@ -1100,75 +1051,60 @@ class Db2VectorStore(VectorStoreBase):
         ISO date strings pass through as VARCHAR for range comparisons.
         """
         op = op.lower()
-        use_p = self._use_param_bindings
-
-        def _inline(v: Any) -> str:
-            return f"'{_normalize_filter_value(v)}'"
-
-        def _bind(v: Any) -> str:
-            """Append value to params and return '?'."""
-            params.append(_normalize_filter_value(v))
-            return "?"
-
-        _val = _bind if use_p else _inline  # noqa: E731
 
         if op == "eq":
             if value is None:
                 return f"{json_expr} IS NULL"
-            if use_p:
-                params.append(_normalize_filter_value(value))
-                return f"({json_expr} IS NOT NULL AND {json_expr} = ?)"
-            return f"({json_expr} IS NOT NULL AND {json_expr} = {_inline(value)})"
+            params.append(_normalize_filter_value(value))
+            return f"({json_expr} IS NOT NULL AND {json_expr} = ?)"
         if op == "ne":
             if value is None:
                 return f"{json_expr} IS NOT NULL"
             # NULL-safe !=: rows where the field is absent also match.
-            if use_p:
-                params.append(_normalize_filter_value(value))
-                return f"({json_expr} IS NULL OR {json_expr} <> ?)"
-            return f"({json_expr} IS NULL OR {json_expr} <> {_inline(value)})"
+            params.append(_normalize_filter_value(value))
+            return f"({json_expr} IS NULL OR {json_expr} <> ?)"
         if op == "gt":
             if _is_iso_date(value):
-                return f"{json_expr} > {_val(value)}"
+                params.append(_normalize_filter_value(value))
+                return f"{json_expr} > ?"
             return f"CAST({json_expr} AS DOUBLE) > {float(value)}"
         if op == "gte":
             if _is_iso_date(value):
-                return f"{json_expr} >= {_val(value)}"
+                params.append(_normalize_filter_value(value))
+                return f"{json_expr} >= ?"
             return f"CAST({json_expr} AS DOUBLE) >= {float(value)}"
         if op == "lt":
             if _is_iso_date(value):
-                return f"{json_expr} < {_val(value)}"
+                params.append(_normalize_filter_value(value))
+                return f"{json_expr} < ?"
             return f"CAST({json_expr} AS DOUBLE) < {float(value)}"
         if op == "lte":
             if _is_iso_date(value):
-                return f"{json_expr} <= {_val(value)}"
+                params.append(_normalize_filter_value(value))
+                return f"{json_expr} <= ?"
             return f"CAST({json_expr} AS DOUBLE) <= {float(value)}"
         if op == "in":
             if not isinstance(value, list):
                 raise ValueError(
                     f"Filter operator 'in' requires a list, got {type(value).__name__}"
                 )
-            if use_p:
-                placeholders = ", ".join("?" for _ in value)
-                params.extend(_normalize_filter_value(v) for v in value)
-                return f"{json_expr} IN ({placeholders})"
-            escaped = ", ".join(f"'{_normalize_filter_value(v)}'" for v in value)
-            return f"{json_expr} IN ({escaped})"
+            placeholders = ", ".join("?" for _ in value)
+            params.extend(_normalize_filter_value(v) for v in value)
+            return f"{json_expr} IN ({placeholders})"
         if op == "nin":
             if not isinstance(value, list):
                 raise ValueError(
                     f"Filter operator 'nin' requires a list, got {type(value).__name__}"
                 )
-            if use_p:
-                placeholders = ", ".join("?" for _ in value)
-                params.extend(_normalize_filter_value(v) for v in value)
-                return f"({json_expr} IS NULL OR {json_expr} NOT IN ({placeholders}))"
-            escaped = ", ".join(f"'{_normalize_filter_value(v)}'" for v in value)
-            return f"({json_expr} IS NULL OR {json_expr} NOT IN ({escaped}))"
+            placeholders = ", ".join("?" for _ in value)
+            params.extend(_normalize_filter_value(v) for v in value)
+            return f"({json_expr} IS NULL OR {json_expr} NOT IN ({placeholders}))"
         if op == "contains":
-            return f"{json_expr} LIKE '%{_normalize_filter_value(value)}%'"
+            params.append(f"%{_normalize_filter_value(value)}%")
+            return f"{json_expr} LIKE ?"
         if op == "icontains":
-            return f"LOWER({json_expr}) LIKE LOWER('%{_normalize_filter_value(value)}%')"
+            params.append(f"%{_normalize_filter_value(value)}%")
+            return f"LOWER({json_expr}) LIKE LOWER(?)"
         raise ValueError(
             f"Unsupported filter operator '{op}'. "
             f"Supported: eq, ne, gt, gte, lt, lte, in, nin, contains, icontains"
