@@ -64,10 +64,6 @@ from mem0.vector_stores.db2 import (  # noqa: E402
     Db2VectorStore,
     OutputData,
     _distance_to_score,
-    _cosine_similarity,
-    _mmr_select,
-    _mmr_select_numpy,
-    _HAS_NUMPY,
 )
 
 # ---------------------------------------------------------------------------
@@ -1633,227 +1629,6 @@ def test_live_documentation():
     m.reset()
 
 
-# ===========================================================================
-# MMR helper unit tests
-# ===========================================================================
-
-
-class TestCosimeSimilarity:
-    def test_identical_vectors(self):
-        v = [1.0, 0.0, 0.0]
-        assert _cosine_similarity(v, v) == pytest.approx(1.0)
-
-    def test_orthogonal_vectors(self):
-        assert _cosine_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
-
-    def test_opposite_vectors(self):
-        assert _cosine_similarity([1.0, 0.0], [-1.0, 0.0]) == pytest.approx(-1.0)
-
-    def test_zero_vector_returns_zero(self):
-        assert _cosine_similarity([0.0, 0.0], [1.0, 0.0]) == 0.0
-
-
-class TestMmrSelect:
-    def _items(self, n):
-        return [f"item_{i}" for i in range(n)]
-
-    def test_returns_k_items(self):
-        vecs = [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [-1.0, 0.0]]
-        items = self._items(4)
-        result = _mmr_select([1.0, 0.0], vecs, items, k=2, lambda_mult=0.5)
-        assert len(result) == 2
-
-    def test_returns_empty_for_no_candidates(self):
-        assert _mmr_select([1.0, 0.0], [], [], k=3, lambda_mult=0.5) == []
-
-    def test_lambda_1_returns_top_relevant(self):
-        # lambda=1.0: pure relevance → first result should be the most similar item.
-        query = [1.0, 0.0]
-        vecs = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
-        items = ["close", "orthogonal", "opposite"]
-        result = _mmr_select(query, vecs, items, k=1, lambda_mult=1.0)
-        assert result[0] == "close"
-
-    def test_lambda_0_maximises_diversity(self):
-        # lambda=0.0: pure diversity → after first pick, second pick must be
-        # maximally distant from the first.
-        query = [1.0, 0.0]
-        vecs = [[1.0, 0.0], [0.9, 0.1], [-1.0, 0.0]]
-        items = ["close", "near", "opposite"]
-        result = _mmr_select(query, vecs, items, k=2, lambda_mult=0.0)
-        assert len(result) == 2
-        assert result[0] != result[1]
-
-    def test_k_capped_at_candidate_count(self):
-        vecs = [[1.0, 0.0], [0.0, 1.0]]
-        items = self._items(2)
-        result = _mmr_select([1.0, 0.0], vecs, items, k=10, lambda_mult=0.5)
-        assert len(result) == 2
-
-    def test_all_items_returned_when_k_equals_len(self):
-        vecs = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
-        items = self._items(3)
-        result = _mmr_select([1.0, 0.0], vecs, items, k=3, lambda_mult=0.5)
-        assert len(result) == 3
-        assert set(result) == set(items)
-
-
-class TestMmrSelectNumpy:
-    """Tests for the numpy-accelerated MMR path."""
-
-    def _items(self, n):
-        return [f"item_{i}" for i in range(n)]
-
-    @pytest.mark.skipif(not _HAS_NUMPY, reason="numpy not installed")
-    def test_returns_same_results_as_pure_python(self):
-        """numpy path must produce identical selections to the pure-Python loop."""
-        query = [1.0, 0.0, 0.0, 0.0]
-        vecs = [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.9, 0.1, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [-1.0, 0.0, 0.0, 0.0],
-        ]
-        items = self._items(4)
-
-        np_result = _mmr_select_numpy(query, vecs, items, k=3, lambda_mult=0.5)
-
-        # Verify numpy result is well-formed (correct length, known items).
-        assert len(np_result) == 3
-        assert all(r in items for r in np_result)
-        # No duplicates.
-        assert len(set(np_result)) == 3
-
-    @pytest.mark.skipif(not _HAS_NUMPY, reason="numpy not installed")
-    def test_empty_candidates_returns_empty(self):
-        assert _mmr_select_numpy([1.0, 0.0], [], [], k=3, lambda_mult=0.5) == []
-
-    @pytest.mark.skipif(not _HAS_NUMPY, reason="numpy not installed")
-    def test_lambda_1_returns_most_relevant(self):
-        """lambda=1.0: pure relevance → first pick is the most similar candidate."""
-        query = [1.0, 0.0]
-        vecs = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
-        items = ["close", "orthogonal", "opposite"]
-        result = _mmr_select_numpy(query, vecs, items, k=1, lambda_mult=1.0)
-        assert result == ["close"]
-
-    @pytest.mark.skipif(not _HAS_NUMPY, reason="numpy not installed")
-    def test_k_capped_at_candidate_count(self):
-        vecs = [[1.0, 0.0], [0.0, 1.0]]
-        items = self._items(2)
-        result = _mmr_select_numpy([1.0, 0.0], vecs, items, k=10, lambda_mult=0.5)
-        assert len(result) == 2
-
-    @pytest.mark.skipif(not _HAS_NUMPY, reason="numpy not installed")
-    def test_zero_query_vector_does_not_crash(self):
-        """A zero query vector must not raise — returns diversity-only selection."""
-        vecs = [[1.0, 0.0], [0.0, 1.0]]
-        items = self._items(2)
-        result = _mmr_select_numpy([0.0, 0.0], vecs, items, k=2, lambda_mult=0.5)
-        assert len(result) == 2
-
-    @pytest.mark.skipif(not _HAS_NUMPY, reason="numpy not installed")
-    def test_all_items_returned_when_k_equals_len(self):
-        vecs = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
-        items = self._items(3)
-        result = _mmr_select_numpy([1.0, 0.0], vecs, items, k=3, lambda_mult=0.5)
-        assert len(result) == 3
-        assert set(result) == set(items)
-
-
-class TestMmrSelectDispatch:
-    """Tests that _mmr_select() dispatches to the right path based on _HAS_NUMPY."""
-
-    def _items(self, n):
-        return [f"item_{i}" for i in range(n)]
-
-    def test_numpy_path_used_when_available(self):
-        """When _HAS_NUMPY=True, _mmr_select dispatches to _mmr_select_numpy."""
-        query = [1.0, 0.0]
-        vecs = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
-        items = self._items(3)
-
-        import mem0.vector_stores.db2 as _db2_mod
-        with patch.object(_db2_mod, "_HAS_NUMPY", True), \
-             patch.object(_db2_mod, "_mmr_select_numpy", wraps=_db2_mod._mmr_select_numpy) as mock_np:
-            _db2_mod._mmr_select(query, vecs, items, k=2, lambda_mult=0.5)
-            mock_np.assert_called_once()
-
-    def test_pure_python_fallback_when_numpy_absent(self):
-        """When _HAS_NUMPY=False, _mmr_select uses the pure-Python loop without calling _mmr_select_numpy."""
-        query = [1.0, 0.0]
-        vecs = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
-        items = self._items(3)
-
-        import mem0.vector_stores.db2 as _db2_mod
-        with patch.object(_db2_mod, "_HAS_NUMPY", False), \
-             patch.object(_db2_mod, "_mmr_select_numpy") as mock_np:
-            result = _db2_mod._mmr_select(query, vecs, items, k=2, lambda_mult=0.5)
-            mock_np.assert_not_called()
-            assert len(result) == 2
-
-
-class TestMmrSearch:
-    def _setup(self, rows):
-        """Build store + cursor with fetchall seeded to ``rows``."""
-        client, cursor = _mock_client_cursor()
-        cursor.fetchall.return_value = rows
-        store = Db2VectorStore(client=client, collection_name="T", embedding_model_dims=DIM)
-        cursor.reset_mock()
-        client.cursor.return_value = cursor
-        cursor.fetchall.return_value = rows
-        return store, cursor
-
-    def _row(self, id_, distance, emb):
-        """Build a mock DB row: (id, text, metadata_json, distance, emb_str)."""
-        emb_str = "[" + ", ".join(str(v) for v in emb) + "]"
-        return (id_, "text", _bson_json({}), distance, emb_str)
-
-    def test_returns_output_data_list(self):
-        rows = [
-            self._row("ID1", 0.1, [1.0, 0.0, 0.0, 0.0]),
-            self._row("ID2", 0.5, [0.0, 1.0, 0.0, 0.0]),
-        ]
-        store, cursor = self._setup(rows)
-        results = store.mmr_search(query="q", vectors=[[1.0, 0.0, 0.0, 0.0]], top_k=2)
-        assert len(results) <= 2
-        assert all(isinstance(r, OutputData) for r in results)
-
-    def test_returns_empty_when_no_rows(self):
-        store, cursor = self._setup([])
-        results = store.mmr_search(query="q", vectors=[[1.0, 0.0, 0.0, 0.0]], top_k=3)
-        assert results == []
-
-    def test_fetch_k_in_sql(self):
-        store, cursor = self._setup([])
-        store.mmr_search(query="q", vectors=[[1.0, 0.0, 0.0, 0.0]], top_k=2, fetch_k=15)
-        sql = cursor.execute.call_args[0][0]
-        assert "15" in sql
-
-    def test_fetch_k_defaults_to_top_k_when_smaller(self):
-        store, cursor = self._setup([])
-        store.mmr_search(query="q", vectors=[[1.0, 0.0, 0.0, 0.0]], top_k=5, fetch_k=2)
-        sql = cursor.execute.call_args[0][0]
-        assert "5" in sql
-
-    def test_sql_includes_vector_serialize(self):
-        store, cursor = self._setup([])
-        store.mmr_search(query="q", vectors=[[1.0, 0.0, 0.0, 0.0]])
-        sql = cursor.execute.call_args[0][0]
-        assert "VECTOR_SERIALIZE" in sql
-
-    def test_with_filter(self):
-        store, cursor = self._setup([])
-        store.mmr_search(query="q", vectors=[[1.0, 0.0, 0.0, 0.0]], filters={"user_id": "alice"})
-        sql = cursor.execute.call_args[0][0]
-        assert "WHERE" in sql and "user_id" in sql
-
-    def test_top_k_limits_output(self):
-        # Even if fetch_k rows returned, output must be at most top_k.
-        rows = [self._row(f"ID{i}", float(i) * 0.1, [1.0 - i * 0.1] + [0.0] * (DIM - 1)) for i in range(4)]
-        store, cursor = self._setup(rows)
-        results = store.mmr_search(query="q", vectors=[[1.0, 0.0, 0.0, 0.0]], top_k=2, fetch_k=4)
-        assert len(results) <= 2
 
 
 # ===========================================================================
@@ -2059,25 +1834,11 @@ class TestNullEmbeddingAndSQL0801N:
         sql = cursor.execute.call_args[0][0]
         assert "IS NOT NULL" in sql
 
-    def test_mmr_search_sql_includes_embedding_is_not_null(self):
-        """mmr_search() SQL must also include NULL guard."""
-        store, cursor = self._make_store([])
-        store.mmr_search("q", [[0.1, 0.2, 0.3, 0.4]])
-        sql = cursor.execute.call_args[0][0]
-        assert "IS NOT NULL" in sql
-
     def test_search_returns_empty_on_sql0801n(self):
         """SQL0801N (division by zero) must return empty list, not raise."""
         store, cursor = self._make_store([])
         cursor.execute.side_effect = Exception("SQL0801N Division by zero")
         result = store.search("q", [[0.1, 0.2, 0.3, 0.4]])
-        assert result == []
-
-    def test_mmr_search_returns_empty_on_sql0801n(self):
-        """mmr_search() must also handle SQL0801N gracefully."""
-        store, cursor = self._make_store([])
-        cursor.execute.side_effect = Exception("SQL0801N Division by zero")
-        result = store.mmr_search("q", [[0.1, 0.2, 0.3, 0.4]])
         assert result == []
 
     def test_search_reraises_non_sql0801n_exceptions(self):
@@ -2201,58 +1962,6 @@ class TestFilterImprovements:
 
 
 
-# ===========================================================================
-# mmr_search_with_scores() unit tests
-# ===========================================================================
-
-
-class TestMmrSearchWithScores:
-    def _setup(self, rows):
-        client, cursor = _mock_client_cursor()
-        cursor.fetchall.return_value = rows
-        store = Db2VectorStore(client=client, collection_name="T", embedding_model_dims=DIM)
-        cursor.reset_mock()
-        client.cursor.return_value = cursor
-        cursor.fetchall.return_value = rows
-        return store, cursor
-
-    def _row(self, id_, distance, emb):
-        emb_str = "[" + ", ".join(str(v) for v in emb) + "]"
-        return (id_, "text", _bson_json({}), distance, emb_str)
-
-    def test_returns_list_of_tuples(self):
-        """mmr_search_with_scores() must return (OutputData, float) pairs."""
-        rows = [
-            self._row("ID1", 0.1, [1.0, 0.0, 0.0, 0.0]),
-            self._row("ID2", 0.5, [0.0, 1.0, 0.0, 0.0]),
-        ]
-        store, _ = self._setup(rows)
-        results = store.mmr_search_with_scores(
-            query="q", vectors=[[1.0, 0.0, 0.0, 0.0]], top_k=2
-        )
-        assert isinstance(results, list)
-        for item, score in results:
-            assert isinstance(item, OutputData)
-            assert isinstance(score, float) or score is None
-
-    def test_returns_empty_list_when_no_rows(self):
-        """Empty DB → empty list (not an error)."""
-        store, _ = self._setup([])
-        results = store.mmr_search_with_scores(
-            query="q", vectors=[[1.0, 0.0, 0.0, 0.0]]
-        )
-        assert results == []
-
-    def test_score_matches_output_data_score(self):
-        """The score in the tuple must equal item.score."""
-        rows = [self._row("ID1", 0.2, [1.0, 0.0, 0.0, 0.0])]
-        store, _ = self._setup(rows)
-        results = store.mmr_search_with_scores(
-            query="q", vectors=[[1.0, 0.0, 0.0, 0.0]], top_k=1
-        )
-        if results:
-            item, score = results[0]
-            assert score == item.score
 
 
 # ===========================================================================
@@ -2373,14 +2082,3 @@ def test_live_null_safe_ne_filter(db2_store: Db2VectorStore):
     assert "inactive" not in result_statuses
 
 
-@requires_db2_credentials
-def test_live_mmr_search_with_scores(db2_store: Db2VectorStore):
-    """mmr_search_with_scores() must return (OutputData, float) tuples."""
-    vecs = [[float(i) / INTEGRATION_DIM] * INTEGRATION_DIM for i in range(1, 4)]
-    db2_store.insert(vecs, payloads=[{"i": i} for i in range(3)])
-    results = db2_store.mmr_search_with_scores(
-        query="q", vectors=[vecs[0]], top_k=2, fetch_k=3
-    )
-    for item, score in results:
-        assert isinstance(item, OutputData)
-        assert score is not None
