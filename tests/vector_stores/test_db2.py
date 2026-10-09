@@ -2197,37 +2197,6 @@ class TestFilterImprovements:
         assert _is_iso_date(None) is False
 
 
-# ===========================================================================
-# clear() TRUNCATE unit tests
-# ===========================================================================
-
-
-class TestClear:
-    def test_clear_issues_truncate(self):
-        """clear() must execute TRUNCATE TABLE … IMMEDIATE."""
-        store, client, cursor = _store()
-        cursor.fetchone.return_value = (5,)  # COUNT(*) returns 5 rows
-        execute_calls = []
-        cursor.execute.side_effect = lambda sql, *a, **kw: execute_calls.append(sql)
-        store.clear()
-        assert any("TRUNCATE" in s and "IMMEDIATE" in s for s in execute_calls), (
-            "Expected TRUNCATE TABLE … IMMEDIATE"
-        )
-
-    def test_clear_returns_row_count(self):
-        """clear() must return how many rows were present before truncation."""
-        store, client, cursor = _store()
-        cursor.fetchone.return_value = (7,)
-        cursor.execute.side_effect = None  # don't accumulate calls, just proceed
-        count = store.clear()
-        assert count == 7
-
-    def test_clear_commits(self):
-        """clear() must commit after truncation."""
-        store, client, cursor = _store()
-        cursor.fetchone.return_value = (0,)
-        store.clear()
-        assert client.commit.called
 
 
 
@@ -2370,18 +2339,6 @@ def test_live_search_null_embedding_excluded(db2_store: Db2VectorStore):
 
 
 
-@requires_db2_credentials
-def test_live_clear(db2_store: Db2VectorStore):
-    """clear() must wipe all rows without dropping the table."""
-    vec = [0.4] * INTEGRATION_DIM
-    db2_store.insert([vec, vec], payloads=[{"name": "a"}, {"name": "b"}])
-    count = db2_store.clear()
-    assert count >= 2
-    info = db2_store.col_info()
-    assert info["row_count"] == 0
-    # Table must still exist after clear()
-    tables = [t.upper() for t in db2_store.list_cols()]
-    assert db2_store.collection_name.upper() in tables
 
 
 @requires_db2_credentials

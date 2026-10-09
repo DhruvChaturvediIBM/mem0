@@ -1048,41 +1048,6 @@ class Db2VectorStore(VectorStoreBase):
         self._maybe_create_vector_index(self.collection_name)
 
     @_handle_db_exceptions
-    def clear(self) -> int:
-        """Remove all rows from the collection using ``TRUNCATE TABLE``.
-
-        Faster than :meth:`reset` for large tables — the table structure and
-        any vector index are preserved.
-
-        Returns:
-            Number of rows that existed before truncation (from a pre-count).
-        """
-        count_sql = f"SELECT COUNT(*) FROM {self.collection_name}"  # noqa: S608
-        with self._get_cursor() as cursor:
-            cursor.execute(count_sql)
-            row = cursor.fetchone()
-            deleted = row[0] if row else 0
-
-        # TRUNCATE TABLE … IMMEDIATE is DDL — auto-commits in Db2.
-        # Commit before, execute the DDL, commit again while cursor is still open.
-        self.client.commit()
-        trunc_cursor = self.client.cursor()
-        try:
-            trunc_cursor.execute(f"TRUNCATE TABLE {self.collection_name} IMMEDIATE")
-            self.client.commit()
-        except Exception:
-            try:
-                self.client.rollback()
-            except Exception:
-                pass
-            raise
-        finally:
-            trunc_cursor.close()
-
-        logger.info("Table %s truncated (%d rows removed).", self.collection_name, deleted)
-        return deleted
-
-    @_handle_db_exceptions
     def keyword_search(
         self,
         query: str,
