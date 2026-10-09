@@ -6,7 +6,6 @@ import functools
 import json
 import logging
 import re
-import math
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
