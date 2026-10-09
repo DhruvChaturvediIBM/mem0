@@ -2230,47 +2230,6 @@ class TestClear:
         assert client.commit.called
 
 
-# ===========================================================================
-# delete_by_filter() unit tests
-# ===========================================================================
-
-
-class TestDeleteByFilter:
-    def test_delete_by_filter_issues_delete_with_where(self):
-        """delete_by_filter() must emit DELETE … WHERE."""
-        store, _, cursor = _store()
-        cursor.rowcount = 3
-        store.delete_by_filter(filters={"user_id": "alice"})
-        sql = cursor.execute.call_args[0][0]
-        assert "DELETE FROM" in sql
-        assert "WHERE" in sql
-        assert "user_id" in sql
-
-    def test_delete_by_filter_commits(self):
-        """delete_by_filter() must commit."""
-        store, client, cursor = _store()
-        cursor.rowcount = 1
-        store.delete_by_filter(filters={"user_id": "alice"})
-        client.commit.assert_called_once()
-
-    def test_delete_by_filter_raises_on_empty_filters(self):
-        """Empty filter must raise ValueError to prevent accidental full-wipe."""
-        store, *_ = _store()
-        with pytest.raises(ValueError, match="non-empty"):
-            store.delete_by_filter(filters={})
-
-    def test_delete_by_filter_raises_on_none_filters(self):
-        """None filter must also raise ValueError."""
-        store, *_ = _store()
-        with pytest.raises(ValueError, match="non-empty"):
-            store.delete_by_filter(filters=None)
-
-    def test_delete_by_filter_returns_row_count(self):
-        """Return value is cursor.rowcount."""
-        store, _, cursor = _store()
-        cursor.rowcount = 4
-        count = store.delete_by_filter(filters={"user_id": "bob"})
-        assert count == 4
 
 
 # ===========================================================================
@@ -2344,7 +2303,7 @@ class TestHandleDbExceptions:
         """ValueError must not be double-wrapped."""
         store, *_ = _store()
         with pytest.raises(ValueError):
-            store.delete_by_filter(filters={})
+            store.insert(vectors=[[]])
 
     def test_type_error_passthrough(self):
         """TypeError must not be double-wrapped."""
@@ -2409,24 +2368,6 @@ def test_live_search_null_embedding_excluded(db2_store: Db2VectorStore):
     assert all(r.id is not None for r in results)
 
 
-@requires_db2_credentials
-def test_live_delete_by_filter(db2_store: Db2VectorStore):
-    """delete_by_filter() must delete only matching rows."""
-    vec = [0.3] * INTEGRATION_DIM
-    db2_store.insert(
-        [vec, vec, vec],
-        payloads=[
-            {"user_id": "alice"},
-            {"user_id": "alice"},
-            {"user_id": "bob"},
-        ],
-    )
-    deleted = db2_store.delete_by_filter(filters={"user_id": "alice"})
-    assert deleted >= 2
-    remaining = db2_store.list(filters={"user_id": "alice"}, top_k=10)[0]
-    assert len(remaining) == 0
-    bob_rows = db2_store.list(filters={"user_id": "bob"}, top_k=10)[0]
-    assert len(bob_rows) >= 1
 
 
 @requires_db2_credentials

@@ -875,35 +875,6 @@ class Db2VectorStore(VectorStoreBase):
             cursor.execute(sql, [vector_id])
 
     @_handle_db_exceptions
-    def delete_by_filter(self, filters: Dict[str, Any]) -> int:
-        """Delete all rows matching *filters*.
-
-        Args:
-            filters: Metadata filter dict — same format as :meth:`search`.
-                     Must be non-empty; passing ``{}`` or ``None`` raises
-                     ``ValueError`` to avoid accidental full-table deletes.
-                     Use :meth:`reset` or :meth:`clear` to wipe all rows.
-
-        Returns:
-            Number of rows deleted.
-        """
-        if not filters:
-            raise ValueError(
-                "filters must be non-empty for delete_by_filter(). "
-                "Use reset() or clear() to delete all rows."
-            )
-        where_clause, filter_params = self._where_clause(filters)
-        if not where_clause:
-            raise ValueError(
-                "The supplied filters produced an empty WHERE clause. "
-                "Use reset() or clear() to delete all rows."
-            )
-        sql = f"DELETE FROM {self.collection_name} {where_clause}"  # noqa: S608
-        with self._get_cursor(commit=True) as cursor:
-            cursor.execute(sql, filter_params) if filter_params else cursor.execute(sql)
-            return cursor.rowcount if cursor.rowcount is not None else 0
-
-    @_handle_db_exceptions
     def update(
         self,
         vector_id: str,
