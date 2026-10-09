@@ -78,11 +78,6 @@ class Db2Config(BaseModel):
         ),
     )
 
-    text_field: str = Field("text", description="Column name for the raw text (CLOB)")
-    id_field: str = Field("id", description="Column name for the primary key (VARCHAR 36)")
-    metadata_field: str = Field("metadata", description="Column name for JSON metadata (BLOB)")
-    embedding_field: str = Field("embedding", description="Column name for the vector (FLOAT32)")
-
     @model_validator(mode="after")
     def _require_connection(self) -> "Db2Config":
         if self.client is None and not self.connection_params:

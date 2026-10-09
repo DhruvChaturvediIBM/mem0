@@ -266,13 +266,6 @@ class TestDb2Config:
         with pytest.raises(ValueError, match="Extra fields"):
             Db2Config(client=object(), unknown_field="x", embedding_model_dims=4)
 
-    def test_default_field_names(self):
-        cfg = Db2Config(client=object(), embedding_model_dims=4)
-        assert cfg.text_field == "text"
-        assert cfg.id_field == "id"
-        assert cfg.metadata_field == "metadata"
-        assert cfg.embedding_field == "embedding"
-
     def test_default_collection_name(self):
         cfg = Db2Config(client=object(), embedding_model_dims=4)
         assert cfg.collection_name == "mem0"
@@ -398,18 +391,6 @@ class TestDb2VectorStoreInit:
         assert store.collection_name == "MEM0_TEST"
         assert store._embedding_dim == DIM
         assert store._distance_strategy == "EUCLIDEAN"
-
-    def test_custom_field_names_are_forwarded(self):
-        store, *_ = _store(
-            text_field="content",
-            id_field="uid",
-            metadata_field="meta",
-            embedding_field="vec",
-        )
-        assert store._text_field == "content"
-        assert store._id_field == "uid"
-        assert store._metadata_field == "meta"
-        assert store._embedding_field == "vec"
 
     def test_create_table_ddl_structure(self):
         client, cursor = _mock_client_cursor()
@@ -1035,11 +1016,6 @@ class TestWhereClause:
         sql, params = self._sql_and_params(s, {"tag": ["x", "y"]})
         assert "IN" in sql
         assert ("x" in sql or "x" in params) and ("y" in sql or "y" in params)
-
-    def test_uses_instance_metadata_field_name(self):
-        store, *_ = _store(metadata_field="my_meta")
-        clause = self._clause(store, {"key": "val"})
-        assert "my_meta" in clause
 
     def test_contains_operator_produces_like(self):
         s = self._store()

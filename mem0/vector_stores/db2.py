@@ -151,20 +151,16 @@ def _create_table_if_not_exists(
     client: Any,
     table_name: str,
     embedding_dim: int,
-    text_field: str,
-    id_field: str,
-    metadata_field: str,
-    embedding_field: str,
 ) -> None:
     if _table_exists(client, table_name):
         logger.info("Table %s already exists.", table_name)
         return
 
     cols = (
-        f"{id_field} VARCHAR(36) PRIMARY KEY NOT NULL, "
-        f"{text_field} CLOB, "
-        f"{metadata_field} BLOB, "
-        f"{embedding_field} VECTOR({embedding_dim}, FLOAT32)"
+        "id VARCHAR(36) PRIMARY KEY NOT NULL, "
+        "text CLOB, "
+        "metadata BLOB, "
+        f"embedding VECTOR({embedding_dim}, FLOAT32)"
     )
     ddl = f"CREATE TABLE {table_name} ({cols})"
     cursor = client.cursor()
@@ -238,10 +234,6 @@ class Db2VectorStore(VectorStoreBase):
             (Podman/Docker) — CE drops TCP connections after the DDL due to
             in-memory ANN graph reconstruction, causing connection failures.
             Keep ``use_vector_index=False`` (the default) on CE containers.
-        text_field: Column name for raw text (default ``"text"``).
-        id_field: Column name for the primary key (default ``"id"``).
-        metadata_field: Column name for JSON metadata (default ``"metadata"``).
-        embedding_field: Column name for the stored vector (default ``"embedding"``).
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -259,10 +251,10 @@ class Db2VectorStore(VectorStoreBase):
         self._check_db2_version()
 
         self.collection_name = self.config.collection_name
-        self._text_field = self.config.text_field
-        self._id_field = self.config.id_field
-        self._metadata_field = self.config.metadata_field
-        self._embedding_field = self.config.embedding_field
+        self._id_field = "id"
+        self._text_field = "text"
+        self._metadata_field = "metadata"
+        self._embedding_field = "embedding"
         self._distance_strategy = self.config.distance_strategy
         self._embedding_dim = self.config.embedding_model_dims
 
@@ -274,10 +266,6 @@ class Db2VectorStore(VectorStoreBase):
             self.client,
             self.collection_name,
             self._embedding_dim,
-            self._text_field,
-            self._id_field,
-            self._metadata_field,
-            self._embedding_field,
         )
 
         # Optionally create ANN vector index (requires 12.1.5+, opt-in via use_vector_index).
@@ -357,10 +345,6 @@ class Db2VectorStore(VectorStoreBase):
             self.client,
             name,
             vector_size,
-            self._text_field,
-            self._id_field,
-            self._metadata_field,
-            self._embedding_field,
         )
         self._maybe_create_vector_index(name)
 
@@ -746,10 +730,6 @@ class Db2VectorStore(VectorStoreBase):
             self.client,
             self.collection_name,
             self._embedding_dim,
-            self._text_field,
-            self._id_field,
-            self._metadata_field,
-            self._embedding_field,
         )
         self._maybe_create_vector_index(self.collection_name)
 

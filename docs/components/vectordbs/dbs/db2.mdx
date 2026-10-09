@@ -92,10 +92,6 @@ config = {
 | `distance_strategy` | Distance function used for search: `EUCLIDEAN` (default), `EUCLIDEAN_DISTANCE`, `COSINE`, `DOT`, `HAMMING`, or `MANHATTAN`. See [Search scores](#search-scores) for conversion details. Only `EUCLIDEAN`, `EUCLIDEAN_DISTANCE`, and `COSINE` are compatible with `use_vector_index=True`. | `EUCLIDEAN` |
 | `use_vector_index` | When `True`, creates a native Db2 ANN vector index (`CREATE VECTOR INDEX`) for approximate nearest-neighbour search. Requires Db2 12.1.5+. Only compatible with `EUCLIDEAN`, `EUCLIDEAN_DISTANCE`, and `COSINE`. Defaults to `False` (exact scan, works on all versions ≥ 12.1.2). | `False` |
 | `db_schema` | Optional Db2 schema name. When set, `SET SCHEMA <name>` is issued immediately after connecting so all unqualified table references resolve to that schema. | `None` |
-| `text_field` | Column name for the raw text (`CLOB`). | `text` |
-| `id_field` | Column name for the primary key (`VARCHAR(36)`). | `id` |
-| `metadata_field` | Column name for JSON metadata (`BLOB`). | `metadata` |
-| `embedding_field` | Column name for the stored vector. | `embedding` |
 
 <Note>
   When you pass a pre-built `client`, Mem0 uses it as-is and will not close it on your behalf.
@@ -230,10 +226,6 @@ config = {
             "distance_strategy": "COSINE",
             "use_vector_index": False,       # set True on Db2 12.1.5+ (production only)
             "db_schema": None,               # optional: e.g. "MEM0SCHEMA"
-            "text_field": "text",
-            "id_field": "id",
-            "metadata_field": "metadata",
-            "embedding_field": "embedding",
         }
     }
 }
