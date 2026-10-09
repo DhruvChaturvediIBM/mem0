@@ -279,7 +279,6 @@ class TestDb2Config:
     def test_default_field_names(self):
         cfg = Db2Config(client=object(), embedding_model_dims=4)
         assert cfg.text_field == "text"
-        assert cfg.text_lemmatized_field == "text_lemmatized"
         assert cfg.id_field == "id"
         assert cfg.metadata_field == "metadata"
         assert cfg.embedding_field == "embedding"
@@ -339,13 +338,6 @@ class TestDb2Config:
                 distance_strategy=strategy, use_vector_index=True,
             )
 
-    # Change 4: text_lemmatized_field config
-    def test_custom_text_lemmatized_field_name(self):
-        cfg = Db2Config(
-            client=object(), embedding_model_dims=4,
-            text_lemmatized_field="lemma_text",
-        )
-        assert cfg.text_lemmatized_field == "lemma_text"
 
 
 # ===========================================================================
@@ -420,19 +412,16 @@ class TestDb2VectorStoreInit:
     def test_custom_field_names_are_forwarded(self):
         store, *_ = _store(
             text_field="content",
-            text_lemmatized_field="lemma",
             id_field="uid",
             metadata_field="meta",
             embedding_field="vec",
         )
         assert store._text_field == "content"
-        assert store._text_lemmatized_field == "lemma"
         assert store._id_field == "uid"
         assert store._metadata_field == "meta"
         assert store._embedding_field == "vec"
 
-    # Change 4: text_lemmatized column in DDL
-    def test_create_table_ddl_includes_text_lemmatized_column(self):
+    def test_create_table_ddl_structure(self):
         client, cursor = _mock_client_cursor()
         # Override fetchone so _table_exists returns 0 (table absent)
         cursor.fetchone.side_effect = [
@@ -447,7 +436,10 @@ class TestDb2VectorStoreInit:
 
         create_stmts = [s for s in execute_calls if "CREATE TABLE" in s]
         assert create_stmts, "Expected CREATE TABLE DDL"
-        assert "text_lemmatized" in create_stmts[0]
+        assert "VARCHAR(36) PRIMARY KEY" in create_stmts[0]
+        assert "CLOB" in create_stmts[0]
+        assert "BLOB" in create_stmts[0]
+        assert "VECTOR(" in create_stmts[0]
 
 
 # ===========================================================================
@@ -537,26 +529,19 @@ class TestInsert:
         ids = store.insert(vectors=vecs)
         assert len(ids) == 5
 
-    # Change 4: text_lemmatized populated on insert
-    def test_insert_populates_text_lemmatized_from_payload(self):
+    def test_insert_populates_text_from_payload(self):
         store, _, cursor = _store()
-        payload = {"data": "raw text", "text_lemmatized": "stem text"}
+        payload = {"data": "raw text"}
         store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]], payloads=[payload])
         rows = cursor.executemany.call_args[0][1]
-        # row tuple: (id, vec_str, json_meta, text, text_lemmatized)
-        assert rows[0][4] == "stem text"
+        # row tuple: (id, vec_str, json_meta, text)
+        assert rows[0][3] == "raw text"
 
-    def test_insert_text_lemmatized_defaults_to_empty_string(self):
+    def test_insert_text_defaults_to_empty_string(self):
         store, _, cursor = _store()
-        store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]], payloads=[{"data": "hello"}])
+        store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]], payloads=[{}])
         rows = cursor.executemany.call_args[0][1]
-        assert rows[0][4] == ""
-
-    def test_insert_sql_includes_text_lemmatized_column(self):
-        store, _, cursor = _store()
-        store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]])
-        sql = cursor.executemany.call_args[0][0]
-        assert "text_lemmatized" in sql
+        assert rows[0][3] == ""
 
 
 # ===========================================================================
@@ -744,21 +729,13 @@ class TestUpdate:
         store.update(str(uuid.uuid4()), payload={"k": "v"})
         client.commit.assert_called_once()
 
-    # Change 4: text_lemmatized populated on update
-    def test_update_populates_text_lemmatized(self):
+    def test_update_populates_text(self):
         store, _, cursor = _store()
-        payload = {"data": "raw", "text_lemmatized": "stem"}
+        payload = {"data": "raw"}
         store.update(str(uuid.uuid4()), payload=payload)
         sql, params = cursor.execute.call_args[0]
-        assert "text_lemmatized" in sql
-        assert "stem" in params
-
-    def test_update_text_lemmatized_defaults_to_empty_string(self):
-        store, _, cursor = _store()
-        store.update(str(uuid.uuid4()), payload={"data": "raw"})
-        sql, params = cursor.execute.call_args[0]
-        assert "text_lemmatized" in sql
-        assert "" in params
+        assert "text" in sql
+        assert "raw" in params
 
 
 # ===========================================================================
@@ -851,7 +828,6 @@ class TestDeleteCol:
         store.client = client
         store.collection_name = "GONE"
         store._text_field = "text"
-        store._text_lemmatized_field = "text_lemmatized"
         store._id_field = "id"
         store._metadata_field = "metadata"
         store._embedding_field = "embedding"
@@ -1259,15 +1235,12 @@ class TestKeywordSearch:
         assert results[0].id == "ID1"
         assert results[0].score == pytest.approx(0.8)  # 80/100
 
-    # Change 4: keyword_search targets text_lemmatized column
-    def test_keyword_search_sql_targets_text_lemmatized(self):
+    def test_keyword_search_sql_targets_text(self):
         store, cursor = self._make_store(True)
         store.keyword_search("park walks")
         sql = cursor.execute.call_args[0][0]
-        assert "text_lemmatized" in sql
-        # Must NOT use the raw text column for CONTAINS/SCORE
-        assert "CONTAINS(text," not in sql
-        assert "SCORE(text," not in sql
+        assert "CONTAINS(text," in sql
+        assert "SCORE(text," in sql
 
     def test_keyword_search_with_filters(self):
         store, cursor = self._make_store(True)
@@ -1425,18 +1398,6 @@ class TestVectorStoreConfig:
         )
         assert cfg.config.use_vector_index is True
 
-    def test_db2_provider_with_text_lemmatized_field(self):
-        from mem0.vector_stores.configs import VectorStoreConfig
-
-        cfg = VectorStoreConfig(
-            provider="db2",
-            config={
-                "client": object(),
-                "embedding_model_dims": 4,
-                "text_lemmatized_field": "my_lemma",
-            },
-        )
-        assert cfg.config.text_lemmatized_field == "my_lemma"
 
 
 # ===========================================================================

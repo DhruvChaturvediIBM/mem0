@@ -293,7 +293,6 @@ def _create_table_if_not_exists(
     id_field: str,
     metadata_field: str,
     embedding_field: str,
-    text_lemmatized_field: str,
 ) -> None:
     if _table_exists(client, table_name):
         logger.info("Table %s already exists.", table_name)
@@ -302,7 +301,6 @@ def _create_table_if_not_exists(
     cols = (
         f"{id_field} VARCHAR(36) PRIMARY KEY NOT NULL, "
         f"{text_field} CLOB, "
-        f"{text_lemmatized_field} CLOB, "
         f"{metadata_field} BLOB, "
         f"{embedding_field} VECTOR({embedding_dim}, FLOAT32)"
     )
@@ -379,9 +377,6 @@ class Db2VectorStore(VectorStoreBase):
             in-memory ANN graph reconstruction, causing connection failures.
             Keep ``use_vector_index=False`` (the default) on CE containers.
         text_field: Column name for raw text (default ``"text"``).
-        text_lemmatized_field: Column name for pre-processed (lemmatized) text
-            (default ``"text_lemmatized"``).  Used by ``keyword_search()`` for
-            higher-recall full-text matching when Db2 Text Search is installed.
         id_field: Column name for the primary key (default ``"id"``).
         metadata_field: Column name for JSON metadata (default ``"metadata"``).
         embedding_field: Column name for the stored vector (default ``"embedding"``).
@@ -403,7 +398,6 @@ class Db2VectorStore(VectorStoreBase):
 
         self.collection_name = self.config.collection_name
         self._text_field = self.config.text_field
-        self._text_lemmatized_field = self.config.text_lemmatized_field
         self._id_field = self.config.id_field
         self._metadata_field = self.config.metadata_field
         self._embedding_field = self.config.embedding_field
@@ -427,7 +421,6 @@ class Db2VectorStore(VectorStoreBase):
             self._id_field,
             self._metadata_field,
             self._embedding_field,
-            self._text_lemmatized_field,
         )
 
         # Optionally create ANN vector index (requires 12.1.5+, opt-in via use_vector_index).
@@ -511,7 +504,6 @@ class Db2VectorStore(VectorStoreBase):
             self._id_field,
             self._metadata_field,
             self._embedding_field,
-            self._text_lemmatized_field,
         )
         self._maybe_create_vector_index(name)
 
@@ -557,7 +549,6 @@ class Db2VectorStore(VectorStoreBase):
                 "[" + ", ".join(str(v) for v in vec) + "]",
                 json.dumps(meta),
                 meta.get("data", ""),
-                meta.get("text_lemmatized", ""),
             )
             for vid, vec, meta in zip(ids, vectors, payloads)
         ]
@@ -566,23 +557,19 @@ class Db2VectorStore(VectorStoreBase):
             sql = (
                 f"MERGE INTO {self.collection_name} AS t "  # noqa: S608
                 f"USING (VALUES (?, VECTOR(?, {embedding_len}, FLOAT32), "
-                f"SYSTOOLS.JSON2BSON(?), ?, ?)) "
+                f"SYSTOOLS.JSON2BSON(?), ?)) "
                 f"AS s({self._id_field}, {self._embedding_field}, "
-                f"{self._metadata_field}, {self._text_field}, "
-                f"{self._text_lemmatized_field}) "
+                f"{self._metadata_field}, {self._text_field}) "
                 f"ON t.{self._id_field} = s.{self._id_field} "
                 f"WHEN MATCHED THEN UPDATE SET "
                 f"t.{self._embedding_field} = s.{self._embedding_field}, "
                 f"t.{self._metadata_field} = s.{self._metadata_field}, "
-                f"t.{self._text_field} = s.{self._text_field}, "
-                f"t.{self._text_lemmatized_field} = s.{self._text_lemmatized_field} "
+                f"t.{self._text_field} = s.{self._text_field} "
                 f"WHEN NOT MATCHED THEN INSERT "
                 f"({self._id_field}, {self._embedding_field}, "
-                f"{self._metadata_field}, {self._text_field}, "
-                f"{self._text_lemmatized_field}) "
+                f"{self._metadata_field}, {self._text_field}) "
                 f"VALUES (s.{self._id_field}, s.{self._embedding_field}, "
-                f"s.{self._metadata_field}, s.{self._text_field}, "
-                f"s.{self._text_lemmatized_field})"
+                f"s.{self._metadata_field}, s.{self._text_field})"
             )
             with self._get_cursor(commit=True) as cursor:
                 for row in rows:
@@ -591,9 +578,8 @@ class Db2VectorStore(VectorStoreBase):
             sql = (
                 f"INSERT INTO {self.collection_name} "  # noqa: S608
                 f"({self._id_field}, {self._embedding_field}, "
-                f"{self._metadata_field}, {self._text_field}, "
-                f"{self._text_lemmatized_field}) "
-                f"VALUES (?, VECTOR(?, {embedding_len}, FLOAT32), SYSTOOLS.JSON2BSON(?), ?, ?)"
+                f"{self._metadata_field}, {self._text_field}) "
+                f"VALUES (?, VECTOR(?, {embedding_len}, FLOAT32), SYSTOOLS.JSON2BSON(?), ?)"
             )
             try:
                 with self._get_cursor(commit=True) as cursor:
@@ -646,18 +632,15 @@ class Db2VectorStore(VectorStoreBase):
         sql = (
             f"MERGE INTO {self.collection_name} AS t "  # noqa: S608
             f"USING (VALUES (?, VECTOR(?, {embedding_len}, FLOAT32), "
-            f"SYSTOOLS.JSON2BSON(?), ?, ?)) "
+            f"SYSTOOLS.JSON2BSON(?), ?)) "
             f"AS s({self._id_field}, {self._embedding_field}, "
-            f"{self._metadata_field}, {self._text_field}, "
-            f"{self._text_lemmatized_field}) "
+            f"{self._metadata_field}, {self._text_field}) "
             f"ON t.{self._id_field} = s.{self._id_field} "
             f"WHEN NOT MATCHED THEN INSERT "
             f"({self._id_field}, {self._embedding_field}, "
-            f"{self._metadata_field}, {self._text_field}, "
-            f"{self._text_lemmatized_field}) "
+            f"{self._metadata_field}, {self._text_field}) "
             f"VALUES (s.{self._id_field}, s.{self._embedding_field}, "
-            f"s.{self._metadata_field}, s.{self._text_field}, "
-            f"s.{self._text_lemmatized_field})"
+            f"s.{self._metadata_field}, s.{self._text_field})"
         )
 
         inserted: List[str] = []
@@ -668,7 +651,6 @@ class Db2VectorStore(VectorStoreBase):
                     "[" + ", ".join(str(v) for v in vec) + "]",
                     json.dumps(meta),
                     meta.get("data", ""),
-                    meta.get("text_lemmatized", ""),
                 )
                 cursor.execute(sql, row)
                 if cursor.rowcount > 0:
@@ -949,8 +931,6 @@ class Db2VectorStore(VectorStoreBase):
         if payload is not None:
             set_parts.append(f"{self._text_field} = ?")
             params.append(payload.get("data", ""))
-            set_parts.append(f"{self._text_lemmatized_field} = ?")
-            params.append(payload.get("text_lemmatized", ""))
             set_parts.append(f"{self._metadata_field} = SYSTOOLS.JSON2BSON(?)")
             params.append(json.dumps(payload))
 
@@ -1093,7 +1073,6 @@ class Db2VectorStore(VectorStoreBase):
             self._id_field,
             self._metadata_field,
             self._embedding_field,
-            self._text_lemmatized_field,
         )
         self._maybe_create_vector_index(self.collection_name)
 
@@ -1141,25 +1120,23 @@ class Db2VectorStore(VectorStoreBase):
     ) -> Optional[List[OutputData]]:
         """Full-text keyword search using Db2 Text Search (``CONTAINS()``).
 
-        Searches the ``text_lemmatized`` column — the pre-processed (stemmed,
-        stop-word-stripped) text populated by mem0's memory pipeline — for
-        higher recall than searching raw text.  Falls back to ``None`` (which
+        Searches the ``text`` column.  Falls back to ``None`` (which
         triggers mem0's semantic-only fallback) when:
 
         * Db2 Text Search addon is not installed/configured (detected at
           startup by :meth:`_probe_text_search`).
-        * The Text Search index does not exist on ``text_lemmatized`` yet.
+        * The Text Search index does not exist on ``text`` yet.
 
         To enable keyword search, create a Text Search index on the
-        ``text_lemmatized`` column::
+        ``text`` column::
 
             CALL SYSPROC.SYSTS_CREATE(
-                CURRENT SCHEMA, '<TABLE>', 'text_lemmatized',
+                CURRENT SCHEMA, '<TABLE>', 'text',
                 'MAXIMUM CHARACTERS 10000 LANGUAGE EN FORMAT NONE'
             );
 
         Args:
-            query: The search query text (lemmatized for best results).
+            query: The search query text.
             top_k: Maximum number of results to return.
             filters: Optional metadata filters.
 
@@ -1175,18 +1152,18 @@ class Db2VectorStore(VectorStoreBase):
 
         if where_clause:
             text_pred = (
-                f"AND CONTAINS({self._text_lemmatized_field}, '{esc_query}') = 1"
+                f"AND CONTAINS({self._text_field}, '{esc_query}') = 1"
             )
         else:
             text_pred = (
-                f"WHERE CONTAINS({self._text_lemmatized_field}, '{esc_query}') = 1"
+                f"WHERE CONTAINS({self._text_field}, '{esc_query}') = 1"
             )
 
         sql = (
             f"SELECT {self._id_field}, "  # noqa: S608
             f"{self._text_field}, "
             f"SYSTOOLS.BSON2JSON({self._metadata_field}), "
-            f"SCORE({self._text_lemmatized_field}, '{esc_query}') AS relevance "
+            f"SCORE({self._text_field}, '{esc_query}') AS relevance "
             f"FROM {self.collection_name} "
             f"{where_clause} "
             f"{text_pred} "

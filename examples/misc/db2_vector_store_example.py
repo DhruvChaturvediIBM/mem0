@@ -460,7 +460,7 @@ def main() -> None:
         print("""
   To create the Text Search index on the mem0 table:
     CALL SYSPROC.SYSTS_CREATE(
-        CURRENT SCHEMA, 'MEM0_EXAMPLE', 'text_lemmatized',
+        CURRENT SCHEMA, 'MEM0_EXAMPLE', 'text',
         'MAXIMUM CHARACTERS 10000 LANGUAGE EN FORMAT NONE'
     );
 """)
@@ -470,7 +470,7 @@ def main() -> None:
         print("  To enable: install the Db2 Text Search addon and create an index:")
         print("    CALL SYSPROC.SYSTS_CREATE(")
         print(f"        CURRENT SCHEMA, '{m.vector_store.config.collection_name.upper()}',")
-        print("        'text_lemmatized', 'MAXIMUM CHARACTERS 10000 LANGUAGE EN FORMAT NONE'")
+        print("        'text', 'MAXIMUM CHARACTERS 10000 LANGUAGE EN FORMAT NONE'")
         print("    );")
 
     # ── 5. Memory.get()  — fetch a single memory by ID ───────────────────────

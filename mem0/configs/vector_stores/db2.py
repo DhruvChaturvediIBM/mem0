@@ -79,14 +79,6 @@ class Db2Config(BaseModel):
     )
 
     text_field: str = Field("text", description="Column name for the raw text (CLOB)")
-    text_lemmatized_field: str = Field(
-        "text_lemmatized",
-        description=(
-            "Column name for pre-processed (stemmed/lemmatized) text (CLOB). "
-            "Populated from payload['text_lemmatized'] on insert/update. "
-            "Used by keyword_search() with Db2 Text Search for higher recall."
-        ),
-    )
     id_field: str = Field("id", description="Column name for the primary key (VARCHAR 36)")
     metadata_field: str = Field("metadata", description="Column name for JSON metadata (BLOB)")
     embedding_field: str = Field("embedding", description="Column name for the vector (FLOAT32)")

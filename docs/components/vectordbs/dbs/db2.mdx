@@ -93,7 +93,6 @@ config = {
 | `use_vector_index` | When `True`, creates a native Db2 ANN vector index (`CREATE VECTOR INDEX`) for approximate nearest-neighbour search. Requires Db2 12.1.5+. Only compatible with `EUCLIDEAN`, `EUCLIDEAN_DISTANCE`, and `COSINE`. Defaults to `False` (exact scan, works on all versions ≥ 12.1.2). | `False` |
 | `db_schema` | Optional Db2 schema name. When set, `SET SCHEMA <name>` is issued immediately after connecting so all unqualified table references resolve to that schema. | `None` |
 | `text_field` | Column name for the raw text (`CLOB`). | `text` |
-| `text_lemmatized_field` | Column name for pre-processed (stemmed/lemmatized) text (`CLOB`). Populated from `payload["text_lemmatized"]` on insert/update. Used by `keyword_search()` with Db2 Text Search for higher recall. | `text_lemmatized` |
 | `id_field` | Column name for the primary key (`VARCHAR(36)`). | `id` |
 | `metadata_field` | Column name for JSON metadata (`BLOB`). | `metadata` |
 | `embedding_field` | Column name for the stored vector. | `embedding` |
@@ -170,13 +169,13 @@ config = {
 
 ### Keyword search (optional, requires Db2 Text Search)
 
-If the Db2 Text Search addon is installed and a Text Search index is created on the `text_lemmatized` column, `keyword_search()` is enabled automatically. Without the addon, Mem0 falls back to semantic-only search.
+If the Db2 Text Search addon is installed and a Text Search index is created on the `text` column, `keyword_search()` is enabled automatically. Without the addon, Mem0 falls back to semantic-only search.
 
 To create the Text Search index:
 
 ```sql
 CALL SYSPROC.SYSTS_CREATE(
-    CURRENT SCHEMA, 'MEM0', 'text_lemmatized',
+    CURRENT SCHEMA, 'MEM0', 'text',
     'MAXIMUM CHARACTERS 10000 LANGUAGE EN FORMAT NONE'
 );
 ```
@@ -232,7 +231,6 @@ config = {
             "use_vector_index": False,       # set True on Db2 12.1.5+ (production only)
             "db_schema": None,               # optional: e.g. "MEM0SCHEMA"
             "text_field": "text",
-            "text_lemmatized_field": "text_lemmatized",
             "id_field": "id",
             "metadata_field": "metadata",
             "embedding_field": "embedding",
