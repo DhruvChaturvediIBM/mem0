@@ -1647,6 +1647,99 @@ class TestPersistentConnection:
         )
 
 
+class TestConnectionOwnership:
+    """The store must only close connections it created itself."""
+
+    _PARAMS = {
+        "database": "DB", "host": "h", "port": 50000,
+        "username": "u", "password": "p",
+    }
+
+    @staticmethod
+    def _init_fetchone():
+        return [("DB2 v12.1.2.0",), None, (1,)]
+
+    def test_del_does_not_close_caller_supplied_client(self):
+        """__del__ must leave a client passed via ``client=`` open."""
+        store, client, _ = _store()
+        assert store._owns_client is False
+        store.__del__()
+        client.close.assert_not_called()
+
+    def test_del_closes_connection_created_by_store(self):
+        """__del__ must close a connection built from connection_params."""
+        with patch("ibm_db_dbi.connect") as mock_connect:
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_cursor.fetchone.side_effect = self._init_fetchone()
+            mock_conn.cursor.return_value = mock_cursor
+            mock_connect.return_value = mock_conn
+
+            store = Db2VectorStore(
+                connection_params=self._PARAMS,
+                collection_name="MEM0_TEST",
+                embedding_model_dims=DIM,
+            )
+            assert store._owns_client is True
+            store.__del__()
+            mock_conn.close.assert_called_once()
+
+    def test_init_failure_closes_owned_connection(self):
+        """A connection the store opened must not leak if __init__ fails."""
+        with patch("ibm_db_dbi.connect") as mock_connect:
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_cursor.fetchone.return_value = ("DB2 v11.5.0.0",)  # too old
+            mock_conn.cursor.return_value = mock_cursor
+            mock_connect.return_value = mock_conn
+
+            with pytest.raises(RuntimeError):
+                Db2VectorStore(
+                    connection_params=self._PARAMS,
+                    collection_name="MEM0_TEST",
+                    embedding_model_dims=DIM,
+                )
+            mock_conn.close.assert_called()
+
+    def test_init_failure_keeps_caller_supplied_client_open(self):
+        """A caller-supplied client must stay open if __init__ fails."""
+        client = MagicMock()
+        cursor = MagicMock()
+        cursor.fetchone.return_value = ("DB2 v11.5.0.0",)  # too old
+        client.cursor.return_value = cursor
+
+        with pytest.raises(RuntimeError):
+            Db2VectorStore(
+                client=client,
+                collection_name="MEM0_TEST",
+                embedding_model_dims=DIM,
+            )
+        client.close.assert_not_called()
+
+    def test_set_schema_failure_closes_new_connection(self):
+        """If SET SCHEMA fails the freshly opened connection must be closed."""
+        with patch("ibm_db_dbi.connect") as mock_connect:
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_cursor.execute.side_effect = Exception("SQL0204N bad schema")
+            mock_conn.cursor.return_value = mock_cursor
+            mock_connect.return_value = mock_conn
+
+            with pytest.raises(RuntimeError, match="Failed to set schema"):
+                Db2VectorStore(
+                    connection_params=self._PARAMS,
+                    collection_name="MEM0_TEST",
+                    embedding_model_dims=DIM,
+                    db_schema="NOSUCH",
+                )
+            mock_conn.close.assert_called_once()
+
+    def test_del_safe_when_init_failed_before_ownership_set(self):
+        """__del__ must not raise if __init__ never got as far as setting state."""
+        store = Db2VectorStore.__new__(Db2VectorStore)
+        store.__del__()  # no AttributeError
+
+
 # ===========================================================================
 # Schema / SET SCHEMA unit tests
 # ===========================================================================

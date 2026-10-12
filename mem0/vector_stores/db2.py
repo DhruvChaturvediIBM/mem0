@@ -236,39 +236,47 @@ class Db2VectorStore(VectorStoreBase):
     """
 
     def __init__(self, **kwargs: Any) -> None:
+        self._owns_client = False
         self.config = Db2Config(**kwargs)
 
-        # Pre-built client takes priority (test / advanced usage).
-        # Otherwise build a fresh connection so each instance owns an isolated handle.
+        # Pre-built client takes priority (test / advanced usage) and stays
+        # owned by the caller.  Otherwise build a fresh connection so each
+        # instance owns an isolated handle, which this store must close.
         if self.config.client is not None:
             self.client = self.config.client
         else:
             self.client = self._build_connection()
+            self._owns_client = True
 
-        # Version check — fail fast if Db2 is too old for AI Vector Search.
-        self._db2_version: Optional[Tuple[int, int, int]] = None
-        self._check_db2_version()
+        try:
+            # Version check — fail fast if Db2 is too old for AI Vector Search.
+            self._db2_version: Optional[Tuple[int, int, int]] = None
+            self._check_db2_version()
 
-        self.collection_name = self.config.collection_name
-        self._id_field = "id"
-        self._text_field = "text"
-        self._metadata_field = "metadata"
-        self._embedding_field = "embedding"
-        self._distance_strategy = self.config.distance_strategy
-        self._embedding_dim = self.config.embedding_model_dims
+            self.collection_name = self.config.collection_name
+            self._id_field = "id"
+            self._text_field = "text"
+            self._metadata_field = "metadata"
+            self._embedding_field = "embedding"
+            self._distance_strategy = self.config.distance_strategy
+            self._embedding_dim = self.config.embedding_model_dims
 
-        # Probe once at startup whether Db2 Text Search is installed.
-        self._text_search_available: bool = self._probe_text_search()
+            # Probe once at startup whether Db2 Text Search is installed.
+            self._text_search_available: bool = self._probe_text_search()
 
-        # Ensure table exists up front so failures surface at construction time.
-        _create_table_if_not_exists(
-            self.client,
-            self.collection_name,
-            self._embedding_dim,
-        )
+            # Ensure table exists up front so failures surface at construction time.
+            _create_table_if_not_exists(
+                self.client,
+                self.collection_name,
+                self._embedding_dim,
+            )
 
-        # Optionally create ANN vector index (requires 12.1.5+, opt-in via use_vector_index).
-        self._maybe_create_vector_index(self.collection_name)
+            # Optionally create ANN vector index (requires 12.1.5+, opt-in via use_vector_index).
+            self._maybe_create_vector_index(self.collection_name)
+        except Exception:
+            # Do not leak a connection this store opened itself.
+            self.close()
+            raise
 
     def _build_connection(self) -> Any:
         """Build a fresh ``ibm_db_dbi.connect()`` connection.
@@ -306,7 +314,14 @@ class Db2VectorStore(VectorStoreBase):
                 cursor.execute(f"SET SCHEMA {self.config.db_schema}")
                 conn.commit()
             except Exception as exc:
-                conn.rollback()
+                try:
+                    conn.rollback()
+                finally:
+                    # The caller never receives this connection, so close it here.
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
                 raise RuntimeError(
                     f"Failed to set schema '{self.config.db_schema}': {exc}"
                 ) from exc
@@ -810,7 +825,14 @@ class Db2VectorStore(VectorStoreBase):
         return results
 
     def close(self) -> None:
-        """Close the underlying database connection."""
+        """Close the database connection if this store opened it.
+
+        A connection supplied through ``client=`` belongs to the caller and is
+        left open.  Safe to call more than once.
+        """
+        if not getattr(self, "_owns_client", False):
+            return
+        self._owns_client = False
         try:
             self.client.close()
             logger.debug("Db2 connection closed.")
@@ -819,10 +841,7 @@ class Db2VectorStore(VectorStoreBase):
 
     def __del__(self) -> None:
         """Best-effort connection cleanup on garbage collection."""
-        try:
-            self.client.close()
-        except Exception:
-            pass
+        self.close()
 
     def _probe_text_search(self) -> bool:
         """Return ``True`` if Db2 Text Search is active on this database."""
