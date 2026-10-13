@@ -1,12 +1,27 @@
 """Pydantic configuration for the IBM Db2 vector store integration."""
 
+import re
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Distance metrics supported by the Db2 ANN vector index.
 # HAMMING, MANHATTAN, and DOT use exact scan — ANN index not available for them.
 _ANN_SUPPORTED_METRICS = {"COSINE", "EUCLIDEAN", "EUCLIDEAN_DISTANCE"}
+
+# Table and schema names are inlined into DDL/DML (identifiers cannot be bound
+# as ``?`` parameters), so only plain unquoted Db2 identifiers are accepted.
+_DB2_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def validate_identifier(name: str, label: str = "identifier") -> str:
+    """Return *name* unchanged if it is a safe Db2 identifier, else raise ``ValueError``."""
+    if not isinstance(name, str) or not _DB2_IDENTIFIER_RE.match(name):
+        raise ValueError(
+            f"Invalid Db2 identifier for {label}: {name!r}. Only letters, digits and "
+            "underscores are allowed, and it must start with a letter."
+        )
+    return name
 
 
 class Db2Config(BaseModel):
@@ -77,6 +92,16 @@ class Db2Config(BaseModel):
             "unqualified table references resolve to this schema."
         ),
     )
+
+    @field_validator("collection_name")
+    @classmethod
+    def _validate_collection_name(cls, v: str) -> str:
+        return validate_identifier(v, "collection_name")
+
+    @field_validator("db_schema")
+    @classmethod
+    def _validate_db_schema(cls, v: Optional[str]) -> Optional[str]:
+        return v if v is None else validate_identifier(v, "db_schema")
 
     @model_validator(mode="after")
     def _require_connection(self) -> "Db2Config":

@@ -87,11 +87,11 @@ config = {
 | --- | --- | --- |
 | `connection_params` | Dict with keys `database`, `host`, `port`, `username`, `password`. Optionally `security` (bool, enables SSL/TLS) and `ssl_cert` (path to `.arm`/`.pem` file). Note: `host` is mapped to the ibm_db connection-string keyword `HOSTNAME` internally. | `None` |
 | `client` | An existing `ibm_db_dbi.Connection` to use instead of building one from `connection_params`. | `None` |
-| `collection_name` | Name of the Db2 table that stores vectors and payloads. Created automatically if it does not exist. | `mem0` |
+| `collection_name` | Name of the Db2 table that stores vectors and payloads. Created automatically if it does not exist. Must start with a letter and contain only letters, digits, and underscores. | `mem0` |
 | `embedding_model_dims` | Dimension of your embedding vectors. Must be greater than 0. | `1536` |
 | `distance_strategy` | Distance function used for search: `EUCLIDEAN` (default), `EUCLIDEAN_DISTANCE`, `COSINE`, `DOT`, `HAMMING`, or `MANHATTAN`. See [Search scores](#search-scores) for conversion details. Only `EUCLIDEAN`, `EUCLIDEAN_DISTANCE`, and `COSINE` are compatible with `use_vector_index=True`. | `EUCLIDEAN` |
 | `use_vector_index` | When `True`, creates a native Db2 ANN vector index (`CREATE VECTOR INDEX`) for approximate nearest-neighbour search. Requires Db2 12.1.5+. Only compatible with `EUCLIDEAN`, `EUCLIDEAN_DISTANCE`, and `COSINE`. Defaults to `False` (exact scan, works on all versions ≥ 12.1.2). | `False` |
-| `db_schema` | Optional Db2 schema name. When set, `SET SCHEMA <name>` is issued immediately after connecting so all unqualified table references resolve to that schema. | `None` |
+| `db_schema` | Optional Db2 schema name. When set, `SET SCHEMA <name>` is issued immediately after connecting so all unqualified table references resolve to that schema. Same naming rules as `collection_name`. | `None` |
 
 <Note>
   When you pass a pre-built `client`, Mem0 uses it as-is and will not close it on your behalf.

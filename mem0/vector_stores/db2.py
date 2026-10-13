@@ -21,7 +21,7 @@ except ImportError as exc:  # pragma: no cover - optional dependency guard
         "Install it with: pip install ibm_db"
     ) from exc
 
-from mem0.configs.vector_stores.db2 import Db2Config
+from mem0.configs.vector_stores.db2 import Db2Config, validate_identifier
 from mem0.vector_stores.base import VectorStoreBase
 
 logger = logging.getLogger(__name__)
@@ -132,7 +132,7 @@ class OutputData(BaseModel):
 
 def _table_exists(client: Any, table_name: str) -> bool:
     """Check table existence via SYSCAT.TABLES — no data scan required."""
-    bare = table_name.strip('"').upper()
+    bare = table_name.upper()
     sql = (
         "SELECT COUNT(*) FROM SYSCAT.TABLES "  # noqa: S608
         "WHERE TABNAME = ? AND TABSCHEMA = CURRENT SCHEMA"
@@ -355,6 +355,7 @@ class Db2VectorStore(VectorStoreBase):
 
     def create_col(self, name: str, vector_size: int, distance: str) -> None:
         """Create (or verify existence of) a Db2 vector table."""
+        validate_identifier(name, "name")
         _create_table_if_not_exists(
             self.client,
             name,
@@ -692,7 +693,7 @@ class Db2VectorStore(VectorStoreBase):
             "WHERE TABNAME = UPPER(?) AND TABSCHEMA = CURRENT SCHEMA"
         )
         with self._get_cursor() as cursor:
-            cursor.execute(sql, [self.collection_name.strip('"')])
+            cursor.execute(sql, [self.collection_name])
             row = cursor.fetchone()
 
         if row is None:
@@ -918,8 +919,7 @@ class Db2VectorStore(VectorStoreBase):
         if self._distance_strategy not in _ANN_SUPPORTED_METRICS:
             return
 
-        bare_name = table_name.strip('"')
-        idx_name = f"{bare_name}_vec_idx"
+        idx_name = f"{table_name}_vec_idx"
         sql_metric = _SQL_METRIC.get(self._distance_strategy, self._distance_strategy)
         ddl = (
             f"CREATE VECTOR INDEX {idx_name} "

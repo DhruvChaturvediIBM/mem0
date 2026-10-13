@@ -1741,6 +1741,85 @@ class TestConnectionOwnership:
 
 
 # ===========================================================================
+# SQL identifier validation (collection_name / db_schema)
+# ===========================================================================
+
+_BAD_IDENTIFIERS = [
+    "DROP TABLE users",
+    "x; DROP TABLE users; --",
+    "x'); DELETE FROM t; --",
+    'x" ; DROP TABLE t',
+    "t(id INT)",
+    "a b",
+    "schema.table",
+    "x--",
+    "1abc",
+    "_abc",
+    "",
+]
+
+_GOOD_IDENTIFIERS = ["T", "t", "mem0", "MEM0_TEST", "my_memories", "A" * 200]
+
+
+class TestIdentifierValidation:
+    @pytest.mark.parametrize("name", _BAD_IDENTIFIERS)
+    def test_config_rejects_bad_collection_name(self, name):
+        with pytest.raises(ValueError, match="Invalid Db2 identifier"):
+            Db2Config(client=object(), collection_name=name, embedding_model_dims=4)
+
+    @pytest.mark.parametrize("name", _BAD_IDENTIFIERS)
+    def test_config_rejects_bad_db_schema(self, name):
+        with pytest.raises(ValueError, match="Invalid Db2 identifier"):
+            Db2Config(client=object(), db_schema=name, embedding_model_dims=4)
+
+    @pytest.mark.parametrize("name", _GOOD_IDENTIFIERS)
+    def test_config_accepts_good_names(self, name):
+        cfg = Db2Config(client=object(), collection_name=name, db_schema=name, embedding_model_dims=4)
+        assert cfg.collection_name == name
+        assert cfg.db_schema == name
+
+    def test_db_schema_none_is_allowed(self):
+        assert Db2Config(client=object(), embedding_model_dims=4).db_schema is None
+
+    def test_bad_name_never_reaches_the_database(self):
+        """Validation must fail before any connection or SQL is attempted."""
+        client = MagicMock()
+        with pytest.raises(ValueError, match="Invalid Db2 identifier"):
+            Db2VectorStore(
+                client=client,
+                collection_name="x; DROP TABLE t; --",
+                embedding_model_dims=DIM,
+            )
+        client.cursor.assert_not_called()
+
+    def test_bad_db_schema_never_issues_set_schema(self):
+        with patch("ibm_db_dbi.connect") as mock_connect:
+            with pytest.raises(ValueError, match="Invalid Db2 identifier"):
+                Db2VectorStore(
+                    connection_params={
+                        "database": "DB", "host": "h", "port": 50000,
+                        "username": "u", "password": "p",
+                    },
+                    collection_name="MEM0_TEST",
+                    db_schema="S; DROP TABLE t",
+                    embedding_model_dims=DIM,
+                )
+            mock_connect.assert_not_called()
+
+    @pytest.mark.parametrize("name", ["x; DROP TABLE t; --", "a b", "t(id INT)"])
+    def test_create_col_rejects_bad_name(self, name):
+        """create_col() takes a name directly and skips the config, so it must check too."""
+        store, _, cursor = _store()
+        with pytest.raises(ValueError, match="Invalid Db2 identifier"):
+            store.create_col(name, DIM, "EUCLIDEAN")
+        cursor.execute.assert_not_called()
+
+    def test_create_col_accepts_good_name(self):
+        store, _, _ = _store()
+        store.create_col("OTHER_TABLE", DIM, "EUCLIDEAN")
+
+
+# ===========================================================================
 # Schema / SET SCHEMA unit tests
 # ===========================================================================
 
