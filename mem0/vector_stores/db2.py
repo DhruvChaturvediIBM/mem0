@@ -369,18 +369,17 @@ class Db2VectorStore(VectorStoreBase):
         vectors: List[list],
         payloads: Optional[List[Dict]] = None,
         ids: Optional[List[str]] = None,
-        upsert: bool = False,
     ) -> List[str]:
         """Insert vectors (with optional payloads / ids) into the table.
+
+        A duplicate primary key raises ``ValueError``.  Use :meth:`update` to
+        change an existing record or :meth:`insert_skip_duplicates` to ignore
+        IDs that already exist.
 
         Args:
             vectors: Embedding vectors to store.
             payloads: Optional list of metadata dicts (one per vector).
             ids: Optional list of string IDs. If omitted, UUIDs are generated.
-            upsert: When ``True``, use ``MERGE INTO`` so existing rows are
-                updated instead of raising a duplicate-key error.
-                When ``False`` (default), a plain ``INSERT`` is used; a
-                duplicate primary key raises ``ValueError``.
 
         Returns:
             List of stored IDs.
@@ -409,45 +408,24 @@ class Db2VectorStore(VectorStoreBase):
             for vid, vec, meta in zip(ids, vectors, payloads)
         ]
 
-        if upsert:
-            sql = (
-                f"MERGE INTO {self.collection_name} AS t "  # noqa: S608
-                f"USING (VALUES (?, VECTOR(?, {embedding_len}, FLOAT32), "
-                f"SYSTOOLS.JSON2BSON(?), ?)) "
-                f"AS s({self._id_field}, {self._embedding_field}, "
-                f"{self._metadata_field}, {self._text_field}) "
-                f"ON t.{self._id_field} = s.{self._id_field} "
-                f"WHEN MATCHED THEN UPDATE SET "
-                f"t.{self._embedding_field} = s.{self._embedding_field}, "
-                f"t.{self._metadata_field} = s.{self._metadata_field}, "
-                f"t.{self._text_field} = s.{self._text_field} "
-                f"WHEN NOT MATCHED THEN INSERT "
-                f"({self._id_field}, {self._embedding_field}, "
-                f"{self._metadata_field}, {self._text_field}) "
-                f"VALUES (s.{self._id_field}, s.{self._embedding_field}, "
-                f"s.{self._metadata_field}, s.{self._text_field})"
-            )
+        sql = (
+            f"INSERT INTO {self.collection_name} "  # noqa: S608
+            f"({self._id_field}, {self._embedding_field}, "
+            f"{self._metadata_field}, {self._text_field}) "
+            f"VALUES (?, VECTOR(?, {embedding_len}, FLOAT32), SYSTOOLS.JSON2BSON(?), ?)"
+        )
+        try:
             with self._get_cursor(commit=True) as cursor:
-                for row in rows:
-                    cursor.execute(sql, row)
-        else:
-            sql = (
-                f"INSERT INTO {self.collection_name} "  # noqa: S608
-                f"({self._id_field}, {self._embedding_field}, "
-                f"{self._metadata_field}, {self._text_field}) "
-                f"VALUES (?, VECTOR(?, {embedding_len}, FLOAT32), SYSTOOLS.JSON2BSON(?), ?)"
-            )
-            try:
-                with self._get_cursor(commit=True) as cursor:
-                    cursor.executemany(sql, rows)
-            except Exception as exc:
-                err = str(exc).lower()
-                if any(ind in err for ind in _DUPLICATE_INDICATORS):
-                    raise ValueError(
-                        f"Duplicate ID detected. Use upsert=True to overwrite "
-                        f"existing records. Original error: {exc}"
-                    ) from exc
-                raise
+                cursor.executemany(sql, rows)
+        except Exception as exc:
+            err = str(exc).lower()
+            if any(ind in err for ind in _DUPLICATE_INDICATORS):
+                raise ValueError(
+                    f"Duplicate ID detected. Use update() to change an existing record "
+                    f"or insert_skip_duplicates() to skip existing IDs. "
+                    f"Original error: {exc}"
+                ) from exc
+            raise
 
         return ids
 

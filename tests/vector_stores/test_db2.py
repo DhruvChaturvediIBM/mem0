@@ -1865,24 +1865,24 @@ class TestSchemaSupport:
 
 
 # ===========================================================================
-# Upsert / DuplicatePolicy / Embedding validation unit tests
+# Duplicate handling / Embedding validation unit tests
 # ===========================================================================
 
 
-class TestUpsertAndDuplicatePolicy:
-    def test_insert_upsert_true_uses_merge_into(self):
-        """upsert=True must emit MERGE INTO."""
-        store, _, cursor = _store()
-        store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]], upsert=True)
-        sql = cursor.execute.call_args[0][0]
-        assert "MERGE INTO" in sql
-
-    def test_insert_upsert_false_uses_insert(self):
-        """Default path must still use INSERT INTO."""
+class TestInsertDuplicatePolicy:
+    def test_insert_uses_plain_insert(self):
+        """insert() must use a plain INSERT, never MERGE."""
         store, _, cursor = _store()
         store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]])
         sql = cursor.executemany.call_args[0][0]
         assert "INSERT INTO" in sql
+        assert "MERGE" not in sql
+
+    def test_insert_has_no_upsert_parameter(self):
+        """upsert was removed to match the other vector stores."""
+        store, *_ = _store()
+        with pytest.raises(TypeError):
+            store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]], upsert=True)
 
     def test_insert_duplicate_raises_value_error(self):
         """Duplicate key exception must be wrapped as ValueError."""
@@ -1891,24 +1891,66 @@ class TestUpsertAndDuplicatePolicy:
         with pytest.raises(ValueError, match="Duplicate ID detected"):
             store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]])
 
-    def test_insert_skip_duplicates_uses_merge_not_matched(self):
-        """insert_skip_duplicates must use MERGE INTO … WHEN NOT MATCHED."""
+    def test_insert_duplicate_message_does_not_mention_upsert(self):
+        store, _, cursor = _store()
+        cursor.executemany.side_effect = Exception("SQL0803N SQLSTATE=23505")
+        with pytest.raises(ValueError) as exc_info:
+            store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]])
+        msg = str(exc_info.value)
+        assert "upsert" not in msg.lower()
+        assert "insert_skip_duplicates" in msg
+
+
+class TestInsertSkipDuplicates:
+    """Unit tests for the SQL shape and return value.
+
+    ``cursor.rowcount`` is mocked here, so these do not prove the real driver
+    reports it correctly; ``test_live_insert_skip_duplicates`` covers that.
+    """
+
+    V = [0.1, 0.2, 0.3, 0.4]
+
+    def test_uses_merge_when_not_matched_only(self):
         store, _, cursor = _store()
         cursor.rowcount = 1
-        store.insert_skip_duplicates(vectors=[[0.1, 0.2, 0.3, 0.4]])
+        store.insert_skip_duplicates(vectors=[self.V], ids=["a"])
         sql = cursor.execute.call_args[0][0]
         assert "MERGE INTO" in sql
         assert "WHEN NOT MATCHED" in sql
         assert "WHEN MATCHED" not in sql
 
-    def test_insert_skip_duplicates_returns_only_inserted_ids(self):
-        """Only IDs actually inserted (rowcount > 0) are returned."""
+    def test_returns_ids_that_were_inserted(self):
         store, _, cursor = _store()
-        cursor.rowcount = 0  # simulate all rows already exist
-        ids_back = store.insert_skip_duplicates(
-            vectors=[[0.1, 0.2, 0.3, 0.4]], ids=["existing-id"]
-        )
-        assert ids_back == []
+        cursor.rowcount = 1
+        assert store.insert_skip_duplicates(vectors=[self.V, self.V], ids=["a", "b"]) == ["a", "b"]
+
+    def test_returns_empty_when_all_rows_exist(self):
+        store, _, cursor = _store()
+        cursor.rowcount = 0
+        assert store.insert_skip_duplicates(vectors=[self.V], ids=["existing"]) == []
+
+    def test_returns_only_rows_that_were_inserted(self):
+        """rowcount alternates per statement: 1 = inserted, 0 = skipped."""
+        store, _, cursor = _store()
+        counts = iter([1, 0, 1])
+
+        def _execute(sql, params=None):
+            cursor.rowcount = next(counts)
+
+        cursor.execute.side_effect = _execute
+        result = store.insert_skip_duplicates(vectors=[self.V] * 3, ids=["a", "b", "c"])
+        assert result == ["a", "c"]
+
+    def test_commits_after_batch(self):
+        store, client, cursor = _store()
+        cursor.rowcount = 1
+        store.insert_skip_duplicates(vectors=[self.V], ids=["a"])
+        client.commit.assert_called_once()
+
+    def test_rejects_invalid_embedding(self):
+        store, *_ = _store()
+        with pytest.raises(TypeError, match="Invalid embedding at index 0"):
+            store.insert_skip_duplicates(vectors=["bad"], ids=["a"])
 
 
 class TestEmbeddingValidation:
@@ -2143,25 +2185,8 @@ class TestHandleDbExceptions:
 
 
 @requires_db2_credentials
-def test_live_insert_upsert_overwrites(db2_store: Db2VectorStore):
-    """upsert=True must overwrite an existing row without error."""
-    vec = [0.1] * INTEGRATION_DIM
-    vid = str(uuid.uuid4())
-    db2_store.insert(vectors=[vec], payloads=[{"name": "original"}], ids=[vid])
-    db2_store.insert(
-        vectors=[[0.9] * INTEGRATION_DIM],
-        payloads=[{"name": "updated"}],
-        ids=[vid],
-        upsert=True,
-    )
-    got = db2_store.get(vid)
-    assert got is not None
-    assert got.payload.get("name") == "updated"
-
-
-@requires_db2_credentials
-def test_live_insert_duplicate_raises_without_upsert(db2_store: Db2VectorStore):
-    """Inserting a duplicate ID without upsert=True must raise ValueError."""
+def test_live_insert_duplicate_raises(db2_store: Db2VectorStore):
+    """Inserting a duplicate ID must raise ValueError."""
     vec = [0.1] * INTEGRATION_DIM
     vid = str(uuid.uuid4())
     db2_store.insert(vectors=[vec], payloads=[{"name": "first"}], ids=[vid])
@@ -2171,16 +2196,24 @@ def test_live_insert_duplicate_raises_without_upsert(db2_store: Db2VectorStore):
 
 @requires_db2_credentials
 def test_live_insert_skip_duplicates(db2_store: Db2VectorStore):
-    """insert_skip_duplicates() must not error and must skip existing IDs."""
+    """insert_skip_duplicates() must skip existing IDs and return only the new ones."""
     vec = [0.2] * INTEGRATION_DIM
-    vid = str(uuid.uuid4())
-    db2_store.insert(vectors=[vec], payloads=[{"name": "original"}], ids=[vid])
+    existing = str(uuid.uuid4())
+    new1, new2 = str(uuid.uuid4()), str(uuid.uuid4())
+    db2_store.insert(vectors=[vec], payloads=[{"name": "original"}], ids=[existing])
+
     inserted = db2_store.insert_skip_duplicates(
-        vectors=[vec], payloads=[{"name": "should_be_skipped"}], ids=[vid]
+        vectors=[vec, vec, vec],
+        payloads=[{"name": "n1"}, {"name": "should_be_skipped"}, {"name": "n2"}],
+        ids=[new1, existing, new2],
     )
-    assert inserted == []
-    got = db2_store.get(vid)
-    assert got.payload.get("name") == "original"
+    assert inserted == [new1, new2]
+    assert db2_store.get(existing).payload.get("name") == "original"
+    assert db2_store.get(new1).payload.get("name") == "n1"
+    assert db2_store.get(new2).payload.get("name") == "n2"
+
+    # Second identical call: everything already exists.
+    assert db2_store.insert_skip_duplicates(vectors=[vec], ids=[new1]) == []
 
 
 @requires_db2_credentials

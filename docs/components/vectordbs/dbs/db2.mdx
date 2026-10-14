@@ -114,6 +114,25 @@ Db2 returns a distance value from `VECTOR_DISTANCE`. Mem0 converts it to a simil
 | `HAMMING` | `1 / (1 + distance)` | `(0, 1]` |
 | `MANHATTAN` | `1 / (1 + distance)` | `(0, 1]` |
 
+### Duplicate IDs
+
+`insert()` stores each record under its `id`. Inserting an `id` that already exists raises a `ValueError` starting with `Duplicate ID detected`. To change an existing record, use `update()`.
+
+The Db2 store also provides `insert_skip_duplicates()`, which inserts only the records whose `id` is not already stored and leaves existing records unchanged. It returns the list of IDs that were actually inserted. This method is specific to the Db2 store and is not part of the shared vector store interface.
+
+<CodeGroup>
+```python Python
+store = m.vector_store  # the Db2 vector store behind Memory
+
+inserted = store.insert_skip_duplicates(
+    vectors=[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+    payloads=[{"data": "a"}, {"data": "b"}],
+    ids=["id-1", "id-2"],
+)
+print(inserted)  # ["id-1", "id-2"] on the first call, [] if both already exist
+```
+</CodeGroup>
+
 ### ANN vector index (optional, Db2 12.1.5+)
 
 By default, Mem0 uses an exact nearest-neighbour scan (works on all Db2 12.1.2+ instances). To enable the native approximate nearest-neighbour (ANN) index for faster search on large collections, set `use_vector_index=True`:
