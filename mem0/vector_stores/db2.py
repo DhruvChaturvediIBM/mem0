@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import math
 import re
 import uuid
 from contextlib import contextmanager
@@ -58,6 +59,8 @@ _ORDER_BY_DIRECTION = {
     "HAMMING":            "ASC",
     "MANHATTAN":          "ASC",
 }
+
+_RANGE_OPS = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
 
 _LOGICAL_OPS = {
     "$and": "AND",
@@ -183,9 +186,9 @@ def _validate_embedding(embedding: Any, allow_none: bool = True) -> None:
 
     Raises:
         ValueError: If the embedding is ``None`` when ``allow_none=False``,
-            or is an empty list.
+            is an empty list, or contains ``nan`` / ``inf``.
         TypeError: If the embedding is not a ``list``, or contains non-numeric
-            values.
+            values (booleans are not accepted).
     """
     if embedding is None:
         if not allow_none:
@@ -195,8 +198,32 @@ def _validate_embedding(embedding: Any, allow_none: bool = True) -> None:
         raise TypeError(f"Embedding must be a list, got {type(embedding).__name__}.")
     if len(embedding) == 0:
         raise ValueError("Embedding cannot be empty.")
-    if not all(isinstance(x, (int, float)) for x in embedding):
+    if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in embedding):
         raise TypeError("All embedding values must be numeric (int or float).")
+    if not all(math.isfinite(x) for x in embedding):
+        raise ValueError("All embedding values must be finite (no nan or inf).")
+
+
+def _validate_top_k(top_k: Any) -> int:
+    """Return *top_k* if it is a positive ``int`` (not a ``bool``), else raise."""
+    if isinstance(top_k, bool) or not isinstance(top_k, int):
+        raise TypeError(f"top_k must be a positive integer, got {type(top_k).__name__}.")
+    if top_k < 1:
+        raise ValueError(f"top_k must be a positive integer, got {top_k}.")
+    return top_k
+
+
+def _to_finite_float(value: Any) -> float:
+    """Convert a range-filter value to a finite ``float`` or raise ``ValueError``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"Range filter value must be numeric, got {type(value).__name__}.")
+    try:
+        number = float(value)
+    except (ValueError, OverflowError):
+        raise ValueError(f"Range filter value must be numeric, got {value!r}.") from None
+    if not math.isfinite(number):
+        raise ValueError("Range filter value must be finite (no nan or inf).")
+    return number
 
 
 class Db2VectorStore(VectorStoreBase):
@@ -501,11 +528,13 @@ class Db2VectorStore(VectorStoreBase):
         filters: Optional[Dict] = None,
     ) -> List[OutputData]:
         """Search for the *top_k* nearest vectors."""
+        top_k = _validate_top_k(top_k)
         if vectors and isinstance(vectors[0], (int, float)):
             embedding = vectors
         else:
             embedding = vectors[0] if vectors else []
-        embedding_len = len(embedding) if embedding else self._embedding_dim
+        _validate_embedding(embedding, allow_none=False)
+        embedding_len = len(embedding)
 
         embedding_str = "[" + ", ".join(str(v) for v in embedding) + "]"
         where_clause, filter_params = self._where_clause(filters)
@@ -523,17 +552,19 @@ class Db2VectorStore(VectorStoreBase):
             f"{self._text_field}, "
             f"SYSTOOLS.BSON2JSON({self._metadata_field}), "
             f"VECTOR_DISTANCE({self._embedding_field}, "
-            f"VECTOR('{embedding_str}', {embedding_len}, FLOAT32), "
+            f"VECTOR(?, {embedding_len}, FLOAT32), "
             f"{sql_metric}) AS distance "
             f"FROM {self.collection_name} "
             f"{full_where} "
             f"ORDER BY distance {order_dir} "
-            f"FETCH FIRST {top_k} ROWS ONLY"
+            f"FETCH FIRST ? ROWS ONLY"
         )
+        # Placeholder order in the SQL: vector, filters, top_k.
+        params = [embedding_str, *filter_params, top_k]
 
         try:
             with self._get_cursor() as cursor:
-                cursor.execute(sql, filter_params) if filter_params else cursor.execute(sql)
+                cursor.execute(sql, params)
                 rows = cursor.fetchall()
         except Exception as exc:
             # SQL0801N: COSINE on a zero-vector causes division by zero.
@@ -579,8 +610,9 @@ class Db2VectorStore(VectorStoreBase):
             vec_str = "[" + ", ".join(str(v) for v in vector) + "]"
             set_parts.append(
                 f"{self._embedding_field} = "
-                f"VECTOR('{vec_str}', {embedding_len}, FLOAT32)"
+                f"VECTOR(?, {embedding_len}, FLOAT32)"
             )
+            params.append(vec_str)
 
         if payload is not None:
             set_parts.append(f"{self._text_field} = ?")
@@ -693,7 +725,11 @@ class Db2VectorStore(VectorStoreBase):
     ) -> List[List[OutputData]]:
         """List records in the collection."""
         where_clause, filter_params = self._where_clause(filters)
-        limit = f"FETCH FIRST {top_k} ROWS ONLY" if top_k is not None else ""
+        params = list(filter_params)
+        limit = ""
+        if top_k is not None:
+            params.append(_validate_top_k(top_k))
+            limit = "FETCH FIRST ? ROWS ONLY"
 
         sql = (
             f"SELECT {self._id_field}, "  # noqa: S608
@@ -705,7 +741,7 @@ class Db2VectorStore(VectorStoreBase):
         )
 
         with self._get_cursor() as cursor:
-            cursor.execute(sql, filter_params) if filter_params else cursor.execute(sql)
+            cursor.execute(sql, params) if params else cursor.execute(sql)
             rows = cursor.fetchall()
 
         results = []
@@ -762,6 +798,7 @@ class Db2VectorStore(VectorStoreBase):
         if not self._text_search_available:
             return None
 
+        top_k = _validate_top_k(top_k)
         esc_query = self._escape_literal(query)
         where_clause, filter_params = self._where_clause(filters)
 
@@ -783,12 +820,13 @@ class Db2VectorStore(VectorStoreBase):
             f"{where_clause} "
             f"{text_pred} "
             f"ORDER BY relevance DESC "
-            f"FETCH FIRST {top_k} ROWS ONLY"
+            f"FETCH FIRST ? ROWS ONLY"
         )
+        params = [*filter_params, top_k]
 
         try:
             with self._get_cursor() as cursor:
-                cursor.execute(sql, filter_params) if filter_params else cursor.execute(sql)
+                cursor.execute(sql, params)
                 rows = cursor.fetchall()
         except Exception as exc:
             logger.debug(
@@ -1039,26 +1077,13 @@ class Db2VectorStore(VectorStoreBase):
             # NULL-safe !=: rows where the field is absent also match.
             params.append(_normalize_filter_value(value))
             return f"({json_expr} IS NULL OR {json_expr} <> ?)"
-        if op == "gt":
+        if op in _RANGE_OPS:
+            sql_op = _RANGE_OPS[op]
             if _is_iso_date(value):
                 params.append(_normalize_filter_value(value))
-                return f"{json_expr} > ?"
-            return f"CAST({json_expr} AS DOUBLE) > {float(value)}"
-        if op == "gte":
-            if _is_iso_date(value):
-                params.append(_normalize_filter_value(value))
-                return f"{json_expr} >= ?"
-            return f"CAST({json_expr} AS DOUBLE) >= {float(value)}"
-        if op == "lt":
-            if _is_iso_date(value):
-                params.append(_normalize_filter_value(value))
-                return f"{json_expr} < ?"
-            return f"CAST({json_expr} AS DOUBLE) < {float(value)}"
-        if op == "lte":
-            if _is_iso_date(value):
-                params.append(_normalize_filter_value(value))
-                return f"{json_expr} <= ?"
-            return f"CAST({json_expr} AS DOUBLE) <= {float(value)}"
+                return f"{json_expr} {sql_op} ?"
+            params.append(_to_finite_float(value))
+            return f"CAST({json_expr} AS DOUBLE) {sql_op} ?"
         if op == "in":
             if not isinstance(value, list):
                 raise ValueError(

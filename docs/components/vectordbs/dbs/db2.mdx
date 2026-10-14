@@ -258,6 +258,10 @@ Filters run against the JSON metadata column. Top-level keys are combined with `
 Supported operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`, `contains`, `icontains`.
 Supported logical keys: `$and`, `$or`, `$not`.
 
+`gt`, `gte`, `lt` and `lte` accept a finite number (or an ISO-8601 date string). Other values, including `nan` and `inf`, raise `ValueError`.
+
+Embeddings must be lists of finite numbers (no `nan`, `inf` or booleans), and `top_k` must be a positive integer. Invalid values raise `ValueError` or `TypeError` before any query is sent.
+
 <CodeGroup>
 ```python Python
 # Simple equality

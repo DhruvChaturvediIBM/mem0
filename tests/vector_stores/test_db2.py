@@ -592,8 +592,9 @@ class TestSearch:
     def test_search_respects_top_k(self):
         store, cursor = self._setup([])
         store.search("q", [[0.1, 0.2, 0.3, 0.4]], top_k=7)
-        sql = cursor.execute.call_args[0][0]
-        assert "7" in sql
+        sql, params = cursor.execute.call_args[0]
+        assert "FETCH FIRST ? ROWS ONLY" in sql
+        assert 7 in params
 
     def test_search_cosine_score_conversion(self):
         rows = [("ID", "txt", _bson_json({}), 0.3)]
@@ -921,8 +922,9 @@ class TestList:
     def test_list_respects_top_k(self):
         store, cursor = self._make_store([])
         store.list(top_k=25)
-        sql = cursor.execute.call_args[0][0]
-        assert "25" in sql
+        sql, params = cursor.execute.call_args[0]
+        assert "FETCH FIRST ? ROWS ONLY" in sql
+        assert 25 in params
 
     def test_list_with_no_top_k_omits_fetch_clause(self):
         store, cursor = self._make_store([])
@@ -1123,20 +1125,24 @@ class TestOpCondition:
         assert "val" in params
 
     def test_gt(self):
-        cond, _ = self._op("gt", 5)
-        assert "> 5.0" in cond and "DOUBLE" in cond
+        cond, params = self._op("gt", 5)
+        assert "> ?" in cond and "DOUBLE" in cond
+        assert params == [5.0]
 
     def test_gte(self):
-        cond, _ = self._op("gte", 5)
-        assert ">= 5.0" in cond
+        cond, params = self._op("gte", 5)
+        assert ">= ?" in cond
+        assert params == [5.0]
 
     def test_lt(self):
-        cond, _ = self._op("lt", 5)
-        assert "< 5.0" in cond
+        cond, params = self._op("lt", 5)
+        assert "< ?" in cond
+        assert params == [5.0]
 
     def test_lte(self):
-        cond, _ = self._op("lte", 5)
-        assert "<= 5.0" in cond
+        cond, params = self._op("lte", 5)
+        assert "<= ?" in cond
+        assert params == [5.0]
 
     def test_in(self):
         cond, params = self._op("in", ["a", "b"])
@@ -1998,6 +2004,230 @@ class TestEmbeddingValidation:
             _validate_embedding(None, allow_none=False)
 
 
+class TestEmbeddingValueGuards:
+    """Non-finite / boolean / empty embeddings are rejected before any SQL runs."""
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_validate_embedding_rejects_non_finite(self, bad):
+        from mem0.vector_stores.db2 import _validate_embedding
+        with pytest.raises(ValueError, match="finite"):
+            _validate_embedding([0.1, bad, 0.3], allow_none=False)
+
+    @pytest.mark.parametrize("bad", [True, False])
+    def test_validate_embedding_rejects_bool(self, bad):
+        from mem0.vector_stores.db2 import _validate_embedding
+        with pytest.raises(TypeError, match="numeric"):
+            _validate_embedding([0.1, bad, 0.3], allow_none=False)
+
+    def test_validate_embedding_accepts_ints_and_tiny_floats(self):
+        from mem0.vector_stores.db2 import _validate_embedding
+        _validate_embedding([1, 0, 1.2e-05, -3], allow_none=False)  # must not raise
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    def test_search_rejects_non_finite_without_running_sql(self, bad):
+        store, _, cursor = _store()
+        cursor.reset_mock()
+        with pytest.raises(ValueError, match="finite"):
+            store.search("q", [[0.1, bad, 0.3, 0.4]])
+        cursor.execute.assert_not_called()
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    def test_update_rejects_non_finite_without_running_sql(self, bad):
+        store, _, cursor = _store()
+        cursor.reset_mock()
+        with pytest.raises(ValueError, match="finite"):
+            store.update("id", vector=[0.1, bad, 0.3, 0.4])
+        cursor.execute.assert_not_called()
+
+    def test_insert_rejects_non_finite(self):
+        store, *_ = _store()
+        with pytest.raises(ValueError, match="finite"):
+            store.insert(vectors=[[0.1, float("nan"), 0.3, 0.4]])
+
+    def test_search_rejects_empty_vector(self):
+        store, _, cursor = _store()
+        cursor.reset_mock()
+        with pytest.raises(ValueError, match="cannot be empty"):
+            store.search("q", [[]])
+        cursor.execute.assert_not_called()
+
+    def test_search_rejects_empty_vectors_list(self):
+        store, _, cursor = _store()
+        cursor.reset_mock()
+        with pytest.raises(ValueError, match="cannot be empty"):
+            store.search("q", [])
+        cursor.execute.assert_not_called()
+
+    def test_search_rejects_string_element(self):
+        store, _, cursor = _store()
+        cursor.reset_mock()
+        with pytest.raises(TypeError, match="numeric"):
+            store.search("q", [[0.1, "0.2]'), 1) --", 0.3, 0.4]])
+        cursor.execute.assert_not_called()
+
+    def test_search_accepts_flat_list(self):
+        store, _, cursor = _store()
+        cursor.fetchall.return_value = []
+        store.search("q", [0.1, 0.2, 0.3, 0.4])
+        cursor.execute.assert_called_once()
+
+
+class TestEmbeddingIsBound:
+    """The query vector goes through a bound parameter, never into the SQL text."""
+
+    def _search_call(self, filters=None):
+        store, _, cursor = _store()
+        cursor.fetchall.return_value = []
+        cursor.reset_mock()
+        store.search("q", [[0.1234567, 0.2, 0.3, 0.4]], filters=filters)
+        return cursor.execute.call_args[0]
+
+    def test_search_sql_has_placeholder_not_numbers(self):
+        args = self._search_call()
+        assert "VECTOR(?" in args[0]
+        assert "0.1234567" not in args[0]
+
+    def test_search_vector_is_first_param(self):
+        args = self._search_call()
+        assert args[1][0] == "[0.1234567, 0.2, 0.3, 0.4]"
+
+    def test_search_vector_param_precedes_filter_params(self):
+        args = self._search_call(filters={"user_id": "bob"})
+        assert args[1][0] == "[0.1234567, 0.2, 0.3, 0.4]"
+        assert "bob" in args[1][1:]
+
+    def test_update_sql_has_placeholder_not_numbers(self):
+        store, _, cursor = _store()
+        cursor.reset_mock()
+        store.update("vid", vector=[0.1234567, 0.2, 0.3, 0.4], payload={"data": "t"})
+        sql, params = cursor.execute.call_args[0]
+        assert "VECTOR(?" in sql
+        assert "0.1234567" not in sql
+        assert params[0] == "[0.1234567, 0.2, 0.3, 0.4]"
+        assert params[-1] == "vid"
+
+    def test_update_vector_only_params(self):
+        store, _, cursor = _store()
+        cursor.reset_mock()
+        store.update("vid", vector=[0.1, 0.2, 0.3, 0.4])
+        _, params = cursor.execute.call_args[0]
+        assert params == ["[0.1, 0.2, 0.3, 0.4]", "vid"]
+
+
+class TestInsertEmbeddingIsBound:
+    """insert() and insert_skip_duplicates() also bind the vector and validate it first."""
+
+    @pytest.mark.parametrize("method", ["insert", "insert_skip_duplicates"])
+    def test_vector_is_bound_not_inlined(self, method):
+        store, _, cursor = _store()
+        cursor.reset_mock()
+        cursor.rowcount = 1
+        getattr(store, method)([[0.1234567, 0.2, 0.3, 0.4]], ids=["a"])
+        args = (cursor.executemany if method == "insert" else cursor.execute).call_args[0]
+        assert "VECTOR(?" in args[0]
+        assert "0.1234567" not in args[0]
+        row = args[1][0] if method == "insert" else args[1]
+        assert "[0.1234567, 0.2, 0.3, 0.4]" in row
+
+    @pytest.mark.parametrize("method", ["insert", "insert_skip_duplicates"])
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), True, "x"])
+    def test_bad_values_rejected_before_sql(self, method, bad):
+        store, _, cursor = _store()
+        cursor.reset_mock()
+        with pytest.raises((ValueError, TypeError)):
+            getattr(store, method)([[0.1, bad, 0.3, 0.4]], ids=["a"])
+        cursor.execute.assert_not_called()
+        cursor.executemany.assert_not_called()
+
+
+class TestTopKValidation:
+    """top_k must be a positive int and is bound, not pasted into the SQL."""
+
+    @pytest.mark.parametrize("bad", [0, -1, 2.5, "5", "5; DROP TABLE x", True, False])
+    def test_search_rejects_bad_top_k(self, bad):
+        store, _, cursor = _store()
+        cursor.reset_mock()
+        with pytest.raises((ValueError, TypeError), match="top_k"):
+            store.search("q", [[0.1, 0.2, 0.3, 0.4]], top_k=bad)
+        cursor.execute.assert_not_called()
+
+    @pytest.mark.parametrize("bad", [0, -1, 2.5, "5", True])
+    def test_list_rejects_bad_top_k(self, bad):
+        store, _, cursor = _store()
+        cursor.reset_mock()
+        with pytest.raises((ValueError, TypeError), match="top_k"):
+            store.list(top_k=bad)
+        cursor.execute.assert_not_called()
+
+    @pytest.mark.parametrize("bad", [0, -1, "5; DROP TABLE x", True])
+    def test_keyword_search_rejects_bad_top_k(self, bad):
+        store, _, cursor = _store()
+        store._text_search_available = True
+        cursor.reset_mock()
+        with pytest.raises((ValueError, TypeError), match="top_k"):
+            store.keyword_search("q", top_k=bad)
+        cursor.execute.assert_not_called()
+
+    def test_search_top_k_is_bound(self):
+        store, _, cursor = _store()
+        cursor.fetchall.return_value = []
+        cursor.reset_mock()
+        store.search("q", [[0.1, 0.2, 0.3, 0.4]], top_k=7)
+        sql, params = cursor.execute.call_args[0]
+        assert "FETCH FIRST ? ROWS ONLY" in sql
+        assert params[-1] == 7
+
+    def test_list_top_k_is_bound(self):
+        store, _, cursor = _store()
+        cursor.fetchall.return_value = []
+        cursor.reset_mock()
+        store.list(top_k=25)
+        sql, params = cursor.execute.call_args[0]
+        assert "FETCH FIRST ? ROWS ONLY" in sql
+        assert params[-1] == 25
+
+    def test_list_none_top_k_still_allowed(self):
+        store, _, cursor = _store()
+        cursor.fetchall.return_value = []
+        store.list(top_k=None)
+        assert "FETCH FIRST" not in cursor.execute.call_args[0][0]
+
+
+class TestRangeFilterIsBound:
+    """gt/gte/lt/lte numeric values are bound parameters; non-finite/non-numeric rejected."""
+
+    def _expr(self):
+        return "JSON_VALUE(SYSTOOLS.BSON2JSON(metadata), '$.field' RETURNING VARCHAR(1000))"
+
+    def _op(self, op, value):
+        store, *_ = _store()
+        params: list = []
+        return store._op_condition(self._expr(), op, value, params), params
+
+    @pytest.mark.parametrize("op,sym", [("gt", ">"), ("gte", ">="), ("lt", "<"), ("lte", "<=")])
+    def test_numeric_value_is_bound(self, op, sym):
+        cond, params = self._op(op, 5)
+        assert f"{sym} ?" in cond
+        assert "DOUBLE" in cond
+        assert "5" not in cond
+        assert params == [5.0]
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_rejects_non_finite(self, bad):
+        with pytest.raises(ValueError, match="finite"):
+            self._op("gt", bad)
+
+    @pytest.mark.parametrize("bad", ["abc", "1; DROP TABLE x", None, [1], True])
+    def test_rejects_non_numeric(self, bad):
+        with pytest.raises(ValueError, match="numeric"):
+            self._op("lt", bad)
+
+    def test_numeric_string_is_accepted(self):
+        cond, params = self._op("gte", "3.5")
+        assert params == [3.5]
+
+
+
 # ===========================================================================
 # NULL-embedding guard + SQL0801N guard unit tests
 # ===========================================================================
@@ -2262,3 +2492,19 @@ def test_live_null_safe_ne_filter(db2_store: Db2VectorStore):
     assert "inactive" not in result_statuses
 
 
+@requires_db2_credentials
+def test_live_bound_range_filter_tiny_floats_and_top_k(db2_store: Db2VectorStore):
+    """Bound range filter, bound vector (incl. tiny floats) and bound FETCH FIRST work on Db2."""
+    tiny = [1.2e-05] * INTEGRATION_DIM
+    db2_store.insert(
+        [tiny, tiny, tiny],
+        payloads=[{"score": 1}, {"score": 5}, {"score": 9}],
+    )
+    results = db2_store.search("q", vectors=[tiny], top_k=5, filters={"score": {"gt": 2}})
+    assert sorted(r.payload["score"] for r in results) == [5, 9]
+
+    results = db2_store.search("q", vectors=[tiny], top_k=5, filters={"score": {"lte": 5.0}})
+    assert sorted(r.payload["score"] for r in results) == [1, 5]
+
+    assert len(db2_store.search("q", vectors=[tiny], top_k=1)) == 1
+    assert len(db2_store.list(top_k=2)[0]) == 2
