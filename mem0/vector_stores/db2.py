@@ -337,23 +337,39 @@ class Db2VectorStore(VectorStoreBase):
 
         if self.config.db_schema:
             cursor = conn.cursor()
+            error: Optional[str] = None
+            cause: Optional[Exception] = None
             try:
-                cursor.execute(f"SET SCHEMA {self.config.db_schema}")
-                conn.commit()
+                # SET SCHEMA accepts a missing schema and Db2 then creates it
+                # implicitly with the first table, so check it exists first.
+                cursor.execute(
+                    "SELECT 1 FROM SYSCAT.SCHEMATA WHERE SCHEMANAME = UPPER(?)",
+                    [self.config.db_schema],
+                )
+                if cursor.fetchone() is None:
+                    error = (
+                        f"Db2 schema '{self.config.db_schema}' does not exist. "
+                        f"Create it first (CREATE SCHEMA {self.config.db_schema})."
+                    )
+                else:
+                    cursor.execute(f"SET SCHEMA {self.config.db_schema}")
+                    conn.commit()
             except Exception as exc:
+                error = f"Failed to set schema '{self.config.db_schema}': {exc}"
+                cause = exc
+            finally:
+                cursor.close()
+
+            if error is not None:
+                # The caller never receives this connection, so close it here.
                 try:
                     conn.rollback()
                 finally:
-                    # The caller never receives this connection, so close it here.
                     try:
                         conn.close()
                     except Exception:
                         pass
-                raise RuntimeError(
-                    f"Failed to set schema '{self.config.db_schema}': {exc}"
-                ) from exc
-            finally:
-                cursor.close()
+                raise RuntimeError(error) from cause
 
         return conn
 

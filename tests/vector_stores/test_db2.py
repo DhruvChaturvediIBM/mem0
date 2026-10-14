@@ -1846,6 +1846,7 @@ class TestSchemaSupport:
             mock_conn = MagicMock()
             mock_cursor = MagicMock()
             mock_cursor.fetchone.side_effect = [
+                (1,),                  # schema exists in SYSCAT.SCHEMATA
                 ("DB2 v12.1.2.0",),   # _check_db2_version
                 None,                  # _probe_text_search
                 (1,),                  # _table_exists → table exists, skip CREATE
@@ -1868,6 +1869,52 @@ class TestSchemaSupport:
             assert any("SET SCHEMA" in s and "MYSCHEMA" in s for s in execute_calls), (
                 "Expected SET SCHEMA MYSCHEMA to be executed"
             )
+
+    def test_missing_schema_raises_and_never_sets_schema(self):
+        """A db_schema that does not exist must raise, not be silently created."""
+        with patch("ibm_db_dbi.connect") as mock_connect:
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_cursor.fetchone.return_value = None  # not found in SYSCAT.SCHEMATA
+            mock_conn.cursor.return_value = mock_cursor
+            mock_connect.return_value = mock_conn
+
+            with pytest.raises(RuntimeError, match="does not exist"):
+                Db2VectorStore(
+                    connection_params={
+                        "database": "DB", "host": "h", "port": 50000,
+                        "username": "u", "password": "p",
+                    },
+                    collection_name="MEM0_TEST",
+                    embedding_model_dims=DIM,
+                    db_schema="NOSUCH",
+                )
+            executed = [c[0][0] for c in mock_cursor.execute.call_args_list]
+            assert not any("SET SCHEMA" in s for s in executed)
+            assert not any("CREATE" in s for s in executed)
+            mock_conn.close.assert_called_once()
+
+    def test_schema_lookup_is_parameterised(self):
+        with patch("ibm_db_dbi.connect") as mock_connect:
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_cursor.fetchone.return_value = None
+            mock_conn.cursor.return_value = mock_cursor
+            mock_connect.return_value = mock_conn
+            with pytest.raises(RuntimeError):
+                Db2VectorStore(
+                    connection_params={
+                        "database": "DB", "host": "h", "port": 50000,
+                        "username": "u", "password": "p",
+                    },
+                    collection_name="MEM0_TEST",
+                    embedding_model_dims=DIM,
+                    db_schema="MYSCHEMA",
+                )
+            sql, params = mock_cursor.execute.call_args_list[0][0]
+            assert "SYSCAT.SCHEMATA" in sql
+            assert "MYSCHEMA" not in sql
+            assert params == ["MYSCHEMA"]
 
 
 # ===========================================================================
@@ -2508,3 +2555,36 @@ def test_live_bound_range_filter_tiny_floats_and_top_k(db2_store: Db2VectorStore
 
     assert len(db2_store.search("q", vectors=[tiny], top_k=1)) == 1
     assert len(db2_store.list(top_k=2)[0]) == 2
+
+
+@requires_db2_credentials
+def test_live_missing_db_schema_raises_and_is_not_created():
+    """A db_schema that does not exist must raise and must not be created."""
+    import ibm_db_dbi
+
+    params = {
+        "database": os.environ["DB2_DATABASE"],
+        "host": os.environ["DB2_HOST"],
+        "port": int(os.environ.get("DB2_PORT", "50000")),
+        "username": os.environ["DB2_USERNAME"],
+        "password": os.environ["DB2_PASSWORD"],
+    }
+    schema = f"NOSUCH_{uuid.uuid4().hex[:8].upper()}"
+    with pytest.raises(RuntimeError, match="does not exist"):
+        Db2VectorStore(
+            connection_params=params,
+            collection_name=f"T_{uuid.uuid4().hex[:8].upper()}",
+            embedding_model_dims=INTEGRATION_DIM,
+            db_schema=schema,
+        )
+    conn = ibm_db_dbi.connect(
+        f"DATABASE={params['database']};HOSTNAME={params['host']};PORT={params['port']};"
+        f"PROTOCOL=TCPIP;UID={params['username']};PWD={params['password']};",
+        "", "",
+    )
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM SYSCAT.SCHEMATA WHERE SCHEMANAME = ?", [schema])
+        assert cur.fetchone() is None
+    finally:
+        conn.close()

@@ -91,7 +91,7 @@ config = {
 | `embedding_model_dims` | Dimension of your embedding vectors. Must be greater than 0. | `1536` |
 | `distance_strategy` | Distance function used for search: `EUCLIDEAN` (default), `EUCLIDEAN_DISTANCE`, `COSINE`, `DOT`, `HAMMING`, or `MANHATTAN`. See [Search scores](#search-scores) for conversion details. Only `EUCLIDEAN`, `EUCLIDEAN_DISTANCE`, and `COSINE` are compatible with `use_vector_index=True`. | `EUCLIDEAN` |
 | `use_vector_index` | When `True`, creates a native Db2 ANN vector index (`CREATE VECTOR INDEX`) for approximate nearest-neighbour search. Requires Db2 12.1.5+. Only compatible with `EUCLIDEAN`, `EUCLIDEAN_DISTANCE`, and `COSINE`. Defaults to `False` (exact scan, works on all versions ≥ 12.1.2). | `False` |
-| `db_schema` | Optional Db2 schema name. When set, `SET SCHEMA <name>` is issued immediately after connecting so all unqualified table references resolve to that schema. Same naming rules as `collection_name`. | `None` |
+| `db_schema` | Optional Db2 schema name. When set, `SET SCHEMA <name>` is issued immediately after connecting so all unqualified table references resolve to that schema. The schema must already exist (`CREATE SCHEMA <name>`), otherwise an error is raised and nothing is created. Same naming rules as `collection_name`. | `None` |
 
 <Note>
   When you pass a pre-built `client`, Mem0 uses it as-is and will not close it on your behalf.
@@ -197,7 +197,7 @@ CALL SYSPROC.SYSTS_CREATE(
 
 ### Schema isolation (optional)
 
-To store all Mem0 tables under a specific Db2 schema rather than the connection user's default schema, set `db_schema`:
+To store all Mem0 tables under a specific Db2 schema rather than the connection user's default schema, set `db_schema`. The schema must already exist (`CREATE SCHEMA MEM0SCHEMA`); if it does not, the store raises an error instead of creating it. `db_schema` only applies when the store opens the connection (`connection_params`), not when you pass your own `client`.
 
 <CodeGroup>
 ```python Python
